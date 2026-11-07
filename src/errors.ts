@@ -1,0 +1,18 @@
+/*! Copyright (c) 2026 iinukami and contributors.
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
+ */
+const messages: Record<string, string> = {
+  invalid_input: '输入不符合要求。', network_error: 'B 站网络请求失败。', timeout: '请求超时。', cancelled: '操作已取消。', stopped: '插件已停止。',
+  access_blocked: 'B 站要求验证或限制访问，请稍后人工检查。', login_required: '需要有效的 B 站登录。', platform_error: 'B 站拒绝了此次操作。',
+  unsupported_media: '此视频未提供当前支持的完整 MP4 媒体。', too_large: '媒体或响应超过本次读取上限。', unsafe_url: '来源地址未通过校验。',
+  malformed_response: 'B 站响应不完整或结构已变化。', reference_unavailable: '引用已过期、不属于当前会话或账号已改变，请重新浏览。',
+  host_required: '宿主缺少临时工具能力，无法安全提供浏览。', session_required: '缺少可信当前会话。', vision_unavailable: '视觉服务当前不可用。',
+  busy: '当前操作数已达上限。', interaction_disabled: '此互动尚未在子插件设置中开启。', folder_required: '请先在设置中选择收藏夹。',
+  duplicate_action: '该动作已提交过，请先核对已有结果，不自动重复发送。', uncertain: '请求已开始提交，但未取得可靠回执；结果不确定，请人工核对，不要重复发送。',
+  config_conflict: '设置或账号已改变，请重新读取后再操作。', config_invalid: '配置格式无效。', account_changed: '账号已改变，本次操作已停止。',
+  subtitle_unavailable: '没有可用字幕；声音处理关闭时不会自动转写。', persistence_error: '本地状态保存失败，未继续发起新动作。',
+};
+export class BiliError extends Error { code: string; constructor(code: string) { super(messages[code] ?? messages.platform_error); this.name = 'BiliError'; this.code = messages[code] ? code : 'platform_error'; } }
+export function safeError(error: unknown) { const e = error instanceof BiliError ? error : new BiliError('network_error'); return { code: e.code, message: e.message }; }
+export function object(value: unknown): Record<string, unknown> { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new BiliError('invalid_input'); return value as Record<string, unknown>; }
