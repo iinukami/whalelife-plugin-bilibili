@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AuthManager, normalizeCookie } from '../src/auth.ts';
+import { BiliClient } from '../src/client.ts';
 import { defaults, parseConfig, updateConfig } from '../src/config.ts';
 import { BiliError, safeError } from '../src/errors.ts';
 import type { BiliClientContract, CallOptions, LoginPoll } from '../src/types.ts';
@@ -32,6 +33,65 @@ function fixture(stored: unknown = {}) {
   const auth = new AuthManager(client as unknown as BiliClientContract, storage, controller.signal, 15000, () => now);
   return { auth, client, storage, controller, writes, setPoll: (value: LoginPoll) => { nextPoll = value; }, advance: (ms: number) => { now += ms; }, calls: () => calls, polls: () => polls };
 }
+
+for (const [hostname, path] of [
+  ['account.bilibili.com', '/h5/account-h5/auth/scan-web'],
+  ['passport.bilibili.com', '/h5-app/passport/login/scan'],
+] as const) test(`official ${hostname} QR destination survives the real client and AuthManager confirmation flow`, async t => {
+  const controller = new AbortController(); let now = 10000, polls = 0;
+  const qrUrl = `https://${hostname}${path}?qrcode_key=${QR_KEY}`;
+  const writes: unknown[] = [], paths: string[] = [];
+  const client = new BiliClient({ signal: controller.signal, transport: {
+    async request(value, options) {
+      const url = new URL(value); paths.push(url.pathname);
+      let data: unknown; const headers: Record<string, string | string[]> = {};
+      if (url.pathname.endsWith('/generate')) {
+        assert.equal(url.origin, 'https://passport.bilibili.com');
+        assert.equal(options.headers?.Cookie, undefined);
+        data = { qrcode_key: QR_KEY, url: qrUrl };
+      } else if (url.pathname.endsWith('/poll')) {
+        assert.equal(url.origin, 'https://passport.bilibili.com');
+        assert.equal(options.headers?.Cookie, undefined);
+        assert.equal(url.searchParams.get('qrcode_key'), QR_KEY);
+        data = { code: polls++ === 0 ? 86101 : 0 };
+        if (polls > 1) headers['set-cookie'] = COOKIE2.split('; ').map(cookie => cookie + '; Path=/; HttpOnly');
+      } else {
+        assert.equal(url.pathname, '/x/web-interface/nav');
+        assert.equal(options.headers?.Cookie, COOKIE2);
+        data = { isLogin: true, mid: 29, uname: 'Synthetic verified account' };
+      }
+      return { url: value, status: 200, headers, body: Buffer.from(JSON.stringify({ code: 0, data })) };
+    }, dispose() {},
+  } });
+  const auth = new AuthManager(client, { async read() { return {}; }, async save(value) { writes.push(structuredClone(value)); } }, controller.signal, 15000, () => now);
+  t.after(async () => { await auth.dispose(); await client.dispose(); });
+  await auth.ready;
+  const login = await auth.beginLogin();
+  assert.equal(login.url, qrUrl); assert.equal(Object.hasOwn(login, 'key'), false);
+  assert.equal(auth.state().loggedIn, false); assert.equal(writes.length, 0);
+  assert.deepEqual(await auth.pollLogin(login.id), { state: 'waiting' });
+  now += 2100;
+  const result = await auth.pollLogin(login.id);
+  assert.equal(result.state, 'confirmed'); assert.equal(result.account?.mid, 29);
+  assert.equal(writes.length, 1); assert.equal(auth.snapshot()?.cookie, COOKIE2);
+  assert.ok(!JSON.stringify(result).includes(QR_KEY));
+  assert.ok(!JSON.stringify(result).includes('SYNTHETIC_SESSION'));
+  assert.equal(paths.length, 4);
+});
+
+test('AuthManager rejects unapproved QR destinations even when a client adapter returns them', async t => {
+  const f = fixture(); t.after(() => f.auth.dispose()); await f.auth.ready;
+  for (const url of [
+    'https://account.bilibili.com.evil.example/scan', 'https://passport.bilibili.tv/scan',
+    'https://account.bilibili.com:444/scan', 'https://synthetic:secret@account.bilibili.com/scan',
+    'http://account.bilibili.com/scan', 'https://account.bilibili.com/scan#fragment',
+    'https://account.bilibili.com/scan?synthetic=' + 'x'.repeat(4096),
+  ]) {
+    f.client.beginLogin = async () => ({ key: QR_KEY, url });
+    await assert.rejects(f.auth.beginLogin(), errorCode('malformed_response'));
+  }
+  assert.equal(f.auth.state().loggedIn, false); assert.equal(f.writes.length, 0);
+});
 
 test('configuration defaults keep audio and every interaction disabled; partial updates preserve independent settings', () => {
   const config = parseConfig({});

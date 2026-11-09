@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { temporaryDirectory, root } from './temporary-directory.ts';
 
-export const CURRENT_HOST = 'ab9ba0b220968e19c14bc93f50188dfa43d2b3ec';
+export const CURRENT_HOST = '38af5e72e466dd6da7f390e445cd1e6cc2f02a69';
 export const MINIMUM_HOST = 'refs/tags/213b52b';
 const MINIMUM_HOST_COMMIT = '7c8e3898b2bc7cb0b892eb0ab2feec0ca9c8aaf0';
 export const RAW_TITLE = 'SYNTHETIC_BILI_FOREIGN_TITLE_DO_NOT_PERSIST';

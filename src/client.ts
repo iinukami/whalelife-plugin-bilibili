@@ -3,6 +3,7 @@
  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
  */
 import { BiliError } from './errors.ts';
+import { validateLoginUrl } from './login-url.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
@@ -247,12 +248,10 @@ export class BiliClient implements BiliClientContract {
   async beginLogin(options: CallOptions) {
     const data = apiData(await this.request('/x/passport-login/web/qrcode/generate', {}, { ...options, cookie: undefined }, true));
     if (typeof data.qrcode_key !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(data.qrcode_key)) throw new BiliError('malformed_response');
-    if (typeof data.url !== 'string') throw new BiliError('malformed_response');
-    const url = safeUrl(data.url);
-    if (!['passport.bilibili.com', 'passport.bilibili.tv'].includes(url.hostname)) throw new BiliError('malformed_response');
+    const url = validateLoginUrl(data.url);
     for (const [key, expiry] of this.loginKeys) if (expiry <= Date.now()) this.loginKeys.delete(key);
     if (!this.loginKeys.has(data.qrcode_key) && this.loginKeys.size >= 4) this.loginKeys.delete(this.loginKeys.keys().next().value!);
-    this.loginKeys.set(data.qrcode_key, Date.now() + 180000); return { key: data.qrcode_key, url: url.href };
+    this.loginKeys.set(data.qrcode_key, Date.now() + 180000); return { key: data.qrcode_key, url };
   }
   async pollLogin(key: string, options: CallOptions): Promise<LoginPoll> {
     const expiry = this.loginKeys.get(key);

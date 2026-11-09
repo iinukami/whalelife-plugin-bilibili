@@ -160,6 +160,42 @@ test('QR login states only return minimal selected cookies after a locally issue
   assert.deepEqual(await f.client.pollLogin(key, {}), { state: 'expired' });
 });
 
+test('QR generation accepts the observed account destination and preserves the passport destination', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  for (const url of [
+    'https://account.bilibili.com/h5/account-h5/auth/scan-web?synthetic=1',
+    'https://passport.bilibili.com/h5-app/passport/login/scan?synthetic=1',
+  ]) {
+    const key = 'synthetic_qr_key_allowed_0123456789';
+    f.json({ qrcode_key: key, url });
+    assert.deepEqual(await f.client.beginLogin({ cookie: COOKIE }), { key, url });
+    const call = f.calls.at(-1)!;
+    assert.equal(new URL(call.url).origin, 'https://passport.bilibili.com');
+    assert.equal(call.options.headers?.Cookie, undefined);
+  }
+});
+
+test('QR destination validation rejects alternate origins, credentials, ports and malformed URLs without retaining keys', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  const key = 'synthetic_qr_key_rejected_0123456789';
+  for (const url of [
+    'https://account.bilibili.com.evil.example/scan', 'https://evil.example/scan',
+    'https://passport.bilibili.tv/scan', 'https://www.bilibili.com/scan',
+    'https://account.bilibili.com:444/scan', 'https://synthetic:secret@passport.bilibili.com/scan',
+    'https://account.bilibili.com@evil.example/scan', 'http://account.bilibili.com/scan',
+    'https://account.bilibili.com/scan#fragment', ' https://account.bilibili.com/scan',
+    'https://account.bilibili.com/scan\n', '//account.bilibili.com/scan',
+    'https://account.bilibili.com/scan?synthetic=' + 'x'.repeat(4096),
+    'https://account.bilibili.com/scan?synthetic=' + '合'.repeat(1000), null, 17,
+  ]) {
+    f.json({ qrcode_key: key, url });
+    await assert.rejects(f.client.beginLogin({}), errorCode('malformed_response'));
+    const count = f.calls.length;
+    assert.deepEqual(await f.client.pollLogin(key, {}), { state: 'expired' });
+    assert.equal(f.calls.length, count, 'an invalid QR destination cannot create a pollable local key');
+  }
+});
+
 test('account and favorites use explicit login and return normalized metadata', async () => {
   const f = fixture(); await assert.rejects(f.client.account({}), errorCode('login_required'));
   f.json({ isLogin: true, mid: 123, uname: '合成账号' }); assert.deepEqual(await f.client.account({ cookie: COOKIE }), { mid: 123, name: '合成账号' });

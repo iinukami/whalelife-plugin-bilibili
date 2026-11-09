@@ -4,6 +4,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { BiliError } from './errors.ts';
+import { validateLoginUrl } from './login-url.ts';
 import type { AccountState, BiliClientContract, CallOptions } from './types.ts';
 
 export interface AccountStorage { read(): Promise<unknown>; save(value: unknown): Promise<void> }
@@ -143,16 +144,14 @@ export class AuthManager {
     const operation = this.reserve();
     const result = await this.client.beginLogin(this.options(operation.controller, signal));
     this.check(operation.generation, signal);
-    let url: URL;
-    try { url = new URL(result.url); } catch { throw new BiliError('malformed_response'); }
-    if (url.origin !== 'https://passport.bilibili.com' || url.username || url.password || result.url.length > 4096 ||
-        typeof result.key !== 'string' || !/^[A-Za-z0-9_-]{8,256}$/.test(result.key)) throw new BiliError('malformed_response');
+    const url = validateLoginUrl(result.url);
+    if (typeof result.key !== 'string' || !/^[A-Za-z0-9_-]{8,256}$/.test(result.key)) throw new BiliError('malformed_response');
     const pending: PendingLogin = { ...operation, id: randomUUID(), key: result.key, expiresAt: this.now() + 180000,
       lastPoll: -Infinity, lastState: { state: 'waiting' } };
     this.pending = pending;
     pending.expiryTimer = setTimeout(() => { if (this.pending === pending) this.clearPending(); }, 180000);
     pending.expiryTimer.unref();
-    return { id: pending.id, url: result.url };
+    return { id: pending.id, url };
   }
   async pollLogin(id: unknown, signal?: AbortSignal): Promise<LoginState> {
     await this.ready; this.check(undefined, signal);
