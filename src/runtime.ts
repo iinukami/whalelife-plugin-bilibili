@@ -11,7 +11,7 @@ type Ref = { session: string; account: string; expires: number; video: VideoItem
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
 type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string };
 export interface RuntimeOptions {
-  signal: AbortSignal; transient: boolean; config: () => Config; account: () => AccountState | undefined;
+  signal: AbortSignal; transient: boolean; config: () => Config; account: () => AccountState | undefined; accountRevision?: () => string;
   readLedger: () => Promise<unknown>; saveLedger: (value: unknown) => Promise<void>; now?: () => number;
   recordAction?: (sessionId: string, eventId: string, action: Action) => Promise<void>;
 }
@@ -51,7 +51,7 @@ export class BiliRuntime {
   status() { return { ready: this.options.transient, vision: Boolean(this.vision && !this.vision.signal.aborted), audioEnabled: this.options.config().audioEnabled,
     interactions: { ...this.options.config().interactions }, ledgerReady: this.ledgerReady, activeRequests: this.active, platformNetwork: 'direct' }; }
   setVision(binding?: OptionalService<VisionService>) { this.vision = binding; for (const ref of this.media.values()) void this.release(ref); this.media.clear(); this.pendingMedia.clear(); }
-  private identity() { return this.options.account()?.revision ?? 'anonymous'; }
+  private identity() { return this.options.accountRevision?.() ?? this.options.account()?.revision ?? 'anonymous'; }
   private guard() { if (this.options.signal.aborted || this.controller.signal.aborted) throw new BiliError('stopped'); if (!this.options.transient) throw new BiliError('host_required'); }
   private sweep() {
     for (const [id, ref] of this.refs) if (ref.expires <= this.now() || ref.account !== this.identity()) this.refs.delete(id);

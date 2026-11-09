@@ -4,7 +4,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { BiliRuntime } from '../src/runtime.ts';
+import { BiliRuntime, type RuntimeOptions } from '../src/runtime.ts';
+import { AuthManager } from '../src/auth.ts';
 import { BiliError } from '../src/errors.ts';
 import { defaults } from '../src/config.ts';
 import type { AccountState, BiliClientContract, VideoDetails } from '../src/types.ts';
@@ -18,7 +19,7 @@ function fixture() {
     subtitles: async () => ({ tracks: [], loginRequired: false }), media: async () => ({ bytes: Buffer.from('synthetic-media'), mime: 'video/mp4' }), account: async () => ({ mid: account?.mid ?? 1, name: 'Synthetic' }),
     interact: async () => { calls++; return behavior(); }, dispose() {} } as unknown as BiliClientContract;
   let saveHook = async () => {};
-  const options = { signal: controller.signal, transient: true, config: () => config, account: () => account, now: () => now, readLedger: async () => saved, saveLedger: async (value: unknown) => { await saveHook(); saved = structuredClone(value); } };
+  const options: RuntimeOptions = { signal: controller.signal, transient: true, config: () => config, account: () => account, now: () => now, readLedger: async () => saved, saveLedger: async (value: unknown) => { await saveHook(); saved = structuredClone(value); } };
   const runtime = new BiliRuntime(client, { status: () => ({}), settings: () => ({ timeoutMs: 5000, concurrency: 2, hasProxy: false }), search: async () => ({}) }, options);
   return { runtime, options, client, controller, config, get saved() { return saved; }, get calls() { return calls; },
     login() { account = { cookie: 'SYNTHETIC_COOKIE', mid: 1, name: 'Synthetic', revision: 'revision-1' }; }, changeAccount() { account = { cookie: 'SYNTHETIC_NEW_COOKIE', mid: 2, name: 'Other', revision: 'revision-2' }; },
@@ -35,6 +36,59 @@ test('references bind to trusted session, expiry and account generation; receipt
   f.advance(); assert.equal((await f.runtime.read('comments', { videoRef: ref }, session) as any).content.error.code, 'reference_unavailable');
   const ref2 = await open(f); f.login(); assert.equal((await f.runtime.read('comments', { videoRef: ref2 }, session) as any).content.error.code, 'reference_unavailable');
   await f.runtime.dispose();
+});
+test('auth account revision prevents anonymous references reviving after an unused login and logout cycle', async t => {
+  const f = fixture(); let auth: AuthManager, stored: unknown = {};
+  t.after(async () => { await auth?.dispose(); await f.runtime.dispose(); });
+  auth = new AuthManager(f.client, { read: async () => stored, save: async value => { stored = structuredClone(value); } }, f.controller.signal);
+  f.options.account = () => auth.snapshot(); f.options.accountRevision = () => auth.state().revision;
+  await auth.ready; await f.runtime.initialize();
+  const initialRevision = auth.state().revision, ref = await open(f);
+  assert.equal((await f.runtime.read('comments', { videoRef: ref }, session) as any).content.status, 'ok');
+  assert.equal((await f.runtime.read('comments', { videoRef: ref }, session) as any).content.status, 'ok');
+  assert.equal(auth.state().revision, initialRevision);
+
+  // Do not invoke the runtime between these transitions: lazy sweeping must not let the old anonymous ref revive.
+  await auth.importCookie('SESSDATA=SYNTHETIC_SESSION; bili_jct=0123456789abcdef0123456789abcdef; DedeUserID=1', initialRevision);
+  assert.equal(auth.state().loggedIn, true);
+  await auth.logout(auth.state().revision);
+  assert.equal(auth.state().loggedIn, false); assert.notEqual(auth.state().revision, initialRevision);
+  let reads = 0; f.client.comments = async () => { reads++; return { items: [], hasMore: false }; };
+  assert.equal((await f.runtime.read('comments', { videoRef: ref }, session) as any).content.error.code, 'reference_unavailable');
+  assert.equal(reads, 0);
+  const currentRef = await open(f);
+  assert.equal((await f.runtime.read('comments', { videoRef: currentRef }, session) as any).content.status, 'ok');
+  assert.equal(reads, 1);
+});
+test('media cache follows auth revisions across anonymous cycles and remains isolated by session', async t => {
+  const f = fixture(); let auth: AuthManager, stored: unknown = {};
+  t.after(async () => { await auth?.dispose(); await f.runtime.dispose(); });
+  auth = new AuthManager(f.client, { read: async () => stored, save: async value => { stored = structuredClone(value); } }, f.controller.signal);
+  f.options.account = () => auth.snapshot(); f.options.accountRevision = () => auth.state().revision;
+  await auth.ready; await f.runtime.initialize();
+  let offers = 0; const released: string[] = [], prepared: string[] = [];
+  f.runtime.setVision({ signal: new AbortController().signal, effect: (create: any) => create(), service: {
+    audiovisualApiVersion: '1.0.0', status: () => ({}),
+    offerMedia: async () => ({ mediaRef: 'SYNTHETIC_PRIVATE_MEDIA_' + ++offers, expiresAt: new Date(2000000).toISOString(), info: {} }),
+    release: async (input: any) => { released.push(input.mediaRef); return {}; },
+    prepare: async (input: any) => { prepared.push(input.mediaRef); return { images: [], coverage: {}, warnings: [] }; },
+  } } as any);
+  const ref = await open(f);
+  assert.equal((await f.runtime.watch({ videoRef: ref }, session) as any).receipt.status, 'completed');
+  assert.equal((await f.runtime.watch({ videoRef: ref }, session) as any).receipt.status, 'completed');
+  assert.equal(offers, 1); assert.deepEqual(prepared, ['SYNTHETIC_PRIVATE_MEDIA_1', 'SYNTHETIC_PRIVATE_MEDIA_1']);
+  const otherSession = { ...session, id: 'synthetic-other-session' };
+  const otherRef = (await f.runtime.read('open', { target: video.bvid }, otherSession) as any).content.data.videoRef;
+  assert.equal((await f.runtime.watch({ videoRef: otherRef }, otherSession) as any).receipt.status, 'completed');
+  assert.equal(offers, 2);
+
+  await auth.importCookie('SESSDATA=SYNTHETIC_SESSION; bili_jct=0123456789abcdef0123456789abcdef; DedeUserID=1', auth.state().revision);
+  await auth.logout(auth.state().revision);
+  const currentRef = await open(f);
+  assert.equal((await f.runtime.watch({ videoRef: currentRef }, session) as any).receipt.status, 'completed');
+  assert.equal(offers, 3); assert.equal(prepared.at(-1), 'SYNTHETIC_PRIVATE_MEDIA_3');
+  assert.deepEqual(released.sort(), ['SYNTHETIC_PRIVATE_MEDIA_1', 'SYNTHETIC_PRIVATE_MEDIA_2']);
+  assert.equal((await f.runtime.watch({ videoRef: otherRef }, otherSession) as any).receipt.code, 'reference_unavailable');
 });
 test('audio disabled calls only visual preparation and never exposes private media reference', async () => {
   const f = fixture(); await f.runtime.initialize(); const ref = await open(f), bindingSignal = new AbortController(); let prepares = 0, understands = 0;

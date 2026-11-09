@@ -25,7 +25,7 @@ export async function applyWithDependencies(ctx: Context, dependencies: Dependen
   const auth = new AuthManager(client, { read: () => ctx.config.read('account.json'), save: value => ctx.config.save('account.json', value) }, ctx.signal, 20000, dependencies.now);
   const surf = ctx.get<SurfService>('surf');
   const transient = typeof ctx.tools.registerTransient === 'function';
-  const runtime = new BiliRuntime(client, surf, { signal: ctx.signal, transient: transient && configValid, config: () => config, account: () => auth.snapshot(),
+  const runtime = new BiliRuntime(client, surf, { signal: ctx.signal, transient: transient && configValid, config: () => config, account: () => auth.snapshot(), accountRevision: () => auth.state().revision,
     readLedger: () => ctx.config.read('actions.json'), saveLedger: value => ctx.config.save('actions.json', value), now: dependencies.now,
     recordAction: async (sessionId, eventId, action) => {
       const labels = { like: '点赞视频', favorite: '收藏视频到所选收藏夹', follow: '关注视频UP主', comment: '发表评论', reply: '回复评论' };
