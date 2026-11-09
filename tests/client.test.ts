@@ -137,7 +137,7 @@ test('reply notifications preserve exact ids and selected public fields without 
   assert.deepEqual(found.cursor, { id: '9007199254740993124', time: 999 }); assert.equal(found.hasMore, true);
   assert.deepEqual(found.items, [{ id: '9007199254740993123', actors: [{ mid: 123, name: 'Synthetic actor' }], time: 1000,
     type: 'reply', business: '评论', title: 'Synthetic video', text: 'Synthetic reply & details', originalText: 'Synthetic original comment',
-    uri: `https://www.bilibili.com/video/${BV}/`, videoTarget: BV }]);
+    uri: `https://www.bilibili.com/video/${BV}/`, videoTarget: BV, target: { aid: 111, rpid: '334', root: '333', authorMid: 123 } }]);
   assert.equal(Object.hasOwn(found.items[0], 'commentRef'), false);
   const request = f.calls[0], url = new URL(request.url);
   assert.equal(url.pathname, '/x/msgfeed/reply'); assert.equal(url.searchParams.get('platform'), 'web');

@@ -12,6 +12,8 @@ const messages: Record<string, string> = {
   duplicate_action: '该动作已提交过，请先核对已有结果，不自动重复发送。', uncertain: '请求已开始提交，但未取得可靠回执；结果不确定，请人工核对，不要重复发送。',
   config_conflict: '设置或账号已改变，请重新读取后再操作。', config_invalid: '配置格式无效。', account_changed: '账号已改变，本次操作已停止。',
   subtitle_unavailable: '没有可用字幕；声音处理关闭时不会自动转写。', persistence_error: '本地状态保存失败，未继续发起新动作。',
+  comment_mismatch: '评论目标与视频或通知不一致，未继续操作。',
+  history_disabled: '尚未开启同步 B 站观看历史。',
 };
 export class BiliError extends Error { code: string; constructor(code: string) { super(messages[code] ?? messages.platform_error); this.name = 'BiliError'; this.code = messages[code] ? code : 'platform_error'; } }
 export function safeError(error: unknown) { const e = error instanceof BiliError ? error : new BiliError('network_error'); return { code: e.code, message: e.message }; }

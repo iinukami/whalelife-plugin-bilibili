@@ -6,13 +6,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { CURRENT_HOST, MINIMUM_HOST, RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO,
-  RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, PRIVATE_NOTIFICATION_CURSOR,
+  RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY, PRIVATE_NOTIFICATION_CURSOR,
   PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF, SYNTHETIC_COOKIE, VIDEO_ID, VIDEO_URL, hostFixture, installVision, until, diskText } from './host-fixture.ts';
 
 const deadline = { timeout: 40000 };
 const prefix = '/plugins/surf/bilibili';
 const callSpec = (name: string, args: unknown = {}) => ({ id: 'synthetic-' + name, name, arguments: JSON.stringify(args) });
-const readTools = ['bilibili_browse', 'bilibili_search', 'bilibili_open', 'bilibili_comments', 'bilibili_subtitles', 'bilibili_notifications'];
+const readTools = ['bilibili_browse', 'bilibili_search', 'bilibili_open', 'bilibili_comments', 'bilibili_subtitles', 'bilibili_notifications', 'bilibili_replies'];
 
 for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
   test(`isolated host ${baseline}: dependency, settings authentication and explicit compatibility`, deadline, async t => {
@@ -23,9 +23,11 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
     assert.ok(f.names().includes('bilibili_status'));
     for (const name of readTools) assert.equal(f.names().includes(name), current, name);
     assert.equal(f.names().includes('bilibili_watch'), false);
+    assert.equal(f.names().includes('bilibili_mark_history'), current);
     const status = await f.service().status();
     assert.equal(status.ready, current);
     assert.equal(status.audioEnabled, false);
+    assert.equal(status.historySyncEnabled, false);
     for (const enabled of Object.values(status.interactions)) assert.equal(enabled, false);
     for (const path of ['/config', '/state', '/settings']) {
       assert.equal((await fetch(f.baseUrl + prefix + path, { signal: AbortSignal.timeout(4000) })).status, 401);
@@ -40,7 +42,11 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
     const publicState: any = await (await f.request(prefix + '/state')).json();
     assert.equal(Object.hasOwn(publicState, 'cookie'), false);
     assert.equal(Object.hasOwn(publicState.account ?? {}, 'cookie'), false);
-    if (current) for (const name of readTools) assert.equal(f.app.tools.entries.get(name).transientResult, true);
+    if (current) {
+      for (const name of readTools) assert.equal(f.app.tools.entries.get(name).transientResult, true);
+      assert.equal(f.app.tools.entries.get('bilibili_mark_history').transientResult, true);
+      assert.equal(f.app.tools.entries.get('bilibili_mark_history').danger, 'full');
+    }
     else {
       await installVision(f);
       assert.equal(f.names().includes('bilibili_watch'), false, 'old host cannot expose media as persistent JSON');
@@ -103,17 +109,24 @@ test('temporary platform content reaches only this model turn; ordinary final co
     if (round === 2) {
       assert.ok(JSON.stringify(request.messages).includes(RAW_DESCRIPTION));
       assert.ok(JSON.stringify(request.messages).includes(RAW_NOTIFICATION_REPLY));
-      return { text: '', toolCalls: [callSpec('bilibili_fixture_echo', { text: RAW_DESCRIPTION + RAW_NOTIFICATION_REPLY })] };
+      const notificationRef = JSON.stringify(request.messages).match(/bili_notice_[0-9a-f-]+/)?.[0];
+      assert.ok(notificationRef, 'the current synthetic model turn must receive the opaque notice reference');
+      return { text: '', toolCalls: [callSpec('bilibili_replies', { notificationRef })] };
+    }
+    if (round === 3) {
+      assert.ok(JSON.stringify(request.messages).includes(RAW_THREAD_ROOT));
+      assert.ok(JSON.stringify(request.messages).includes(RAW_THREAD_REPLY));
+      return { text: '', toolCalls: [callSpec('bilibili_fixture_echo', { text: RAW_DESCRIPTION + RAW_NOTIFICATION_REPLY + RAW_THREAD_REPLY })] };
     }
     return { text: visible, toolCalls: [] };
   });
   assert.equal(await f.service('conversation-fixture').run({ sessionId: f.sessionId, text: '请看这个视频', persona: 'a', permission: 'full' }), visible);
-  assert.equal(round, 3);
+  assert.equal(round, 4);
   assert.equal((await f.app.memory.readSession(f.sessionId)).at(-1).text, visible);
   f.model(request => {
     const serialized = JSON.stringify(request.messages);
     assert.ok(serialized.includes(visible));
-    for (const marker of [RAW_TITLE, RAW_DESCRIPTION, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, PRIVATE_QUERY]) assert.ok(!serialized.includes(marker));
+    for (const marker of [RAW_TITLE, RAW_DESCRIPTION, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY, PRIVATE_QUERY]) assert.ok(!serialized.includes(marker));
     return { text: '继续看你选的视频。', toolCalls: [] };
   });
   await f.service('conversation-fixture').run({ sessionId: f.sessionId, text: '继续', persona: 'a', permission: 'full' });
@@ -214,6 +227,110 @@ test('synthetic cookie import enables following, redacts credentials and invalid
   assert.ok(!JSON.stringify(poll).includes('synthetic-qr-key'));
   assert.equal(f.requests.length, 0);
   await f.assertPrivate([anonymous.result.data.videoRef, videoRef, 'synthetic-qr-key']);
+});
+
+test('verified notification conversations provide reply references without weakening the reply switch or host permissions', deadline, async t => {
+  const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
+  const initial: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+  const tool = f.app.tools.entries.get('bilibili_replies');
+  assert.equal(tool.danger, 'safe'); assert.equal(tool.transientResult, true);
+  const notices = await f.call('bilibili_notifications', { source: 'replies' });
+  const notice = notices.result.data.items[0], notificationRef = notice.notificationRef;
+  assert.equal(typeof notificationRef, 'string'); assert.equal(Object.hasOwn(notice, 'target'), false);
+  assert.equal(Object.hasOwn(notice, 'commentRef'), false, 'a notification is not yet a verified comment');
+  const first = await f.call('bilibili_replies', { notificationRef });
+  assert.equal(first.result.status, 'ok');
+  const data = first.result.data;
+  assert.equal(data.untrusted, true); assert.equal(data.root.text, RAW_THREAD_ROOT); assert.equal(data.target.text, RAW_THREAD_REPLY);
+  assert.equal(data.target.rpid, '90071992547409931'); assert.equal(data.target.root, data.root.rpid);
+  assert.equal(data.target.commentRef, data.items[0].commentRef, 'the same verified target must reuse its reference within one response');
+  assert.equal(data.contextComplete, false); assert.equal(data.targetOnPage, true); assert.equal(data.nextPage, 2);
+  const second = await f.call('bilibili_replies', { notificationRef, page: data.nextPage });
+  assert.equal(second.result.status, 'ok'); assert.equal(second.result.data.hasMore, false);
+  assert.equal(second.result.data.contextComplete, false, 'reading the last page alone does not prove complete context');
+  assert.equal(second.result.data.targetOnPage, false); assert.equal(second.result.data.target.rpid, data.target.rpid);
+  const reopened = await f.call('bilibili_replies', { commentRef: data.target.commentRef });
+  assert.equal(reopened.result.status, 'ok'); assert.equal(reopened.result.data.target.rpid, data.target.rpid);
+  for (const args of [{}, { notificationRef, commentRef: data.target.commentRef }, { commentRef: data.video.videoRef }]) {
+    assert.equal((await f.call('bilibili_replies', args)).result.error.code, 'invalid_input');
+  }
+  const ownText = 'SYNTHETIC_BILI_NOTIFICATION_REPLY_OUTGOING_DO_NOT_PERSIST';
+  const args = { action: 'reply', commentRef: data.target.commentRef, operationId: 'synthetic-notification-reply', text: ownText };
+  assert.equal((await f.call('bilibili_interact', args)).result.error.code, 'interaction_disabled');
+  const settings: any = await (await f.request(prefix + '/config')).json();
+  assert.equal((await f.request(prefix + '/config', { revision: settings.revision,
+    config: { ...settings.config, interactions: { ...settings.config.interactions, reply: true } } })).status, 200);
+  assert.equal((await f.app.tools.call('bilibili_interact', args, { id: f.sessionId, permission: 'ask' })).ok, false);
+  assert.equal((await fixture.stats()).submissions.length, 0);
+  const sent = await f.call('bilibili_interact', args);
+  assert.equal(sent.result.data.state, 'confirmed');
+  assert.deepEqual((await fixture.stats()).submissions, [{ action: 'reply', aid: 12345, mid: 9988,
+    root: '90071992547409930', parent: '90071992547409931' }]);
+  assert.equal((await f.call('bilibili_interact', args)).result.data.duplicate, true);
+  assert.equal((await fixture.stats()).submissions.length, 1);
+  assert.equal(f.requests.length, 0);
+  const refs = [notificationRef, data.video.videoRef, data.root.commentRef, data.target.commentRef, ownText];
+  const pluginData = await diskText(join(f.bilibili, 'data'));
+  for (const marker of [RAW_THREAD_ROOT, RAW_THREAD_REPLY, ...refs]) assert.ok(!pluginData.includes(marker));
+  await f.assertPrivate(refs);
+});
+
+test('notification conversations reject changed targets and never mint reply references for unverified or non-video notices', deadline, async t => {
+  const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
+  const initial: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+  const refs: string[] = [];
+  for (const scenario of ['video-aid', 'comment-aid', 'comment-rpid', 'comment-root', 'comment-author',
+    'thread-aid', 'thread-root', 'thread-root-author', 'thread-target-author', 'comment-missing']) {
+    await fixture.configure(scenario);
+    const notices = await f.call('bilibili_notifications', { source: 'replies' });
+    const notificationRef = notices.result.data.items[0].notificationRef; refs.push(notificationRef);
+    const result = await f.call('bilibili_replies', { notificationRef });
+    assert.equal(result.result.status, 'error', scenario);
+    assert.equal(result.result.error.code, scenario === 'comment-missing' ? 'reference_unavailable' : 'comment_mismatch', scenario);
+    assert.ok(!JSON.stringify(result).includes('commentRef'), scenario + ' must fail before exposing any reply reference');
+  }
+  for (const scenario of ['notification-unknown', 'notification-unverified']) {
+    await fixture.configure(scenario);
+    const notices = await f.call('bilibili_notifications', { source: 'replies' });
+    assert.equal(notices.result.status, 'ok');
+    assert.equal(Object.hasOwn(notices.result.data.items[0], 'notificationRef'), false);
+  }
+  await fixture.configure('normal');
+  const likes = await f.call('bilibili_notifications', { source: 'likes' });
+  assert.equal(Object.hasOwn(likes.result.data.items[0], 'notificationRef'), false);
+  assert.equal((await fixture.stats()).submissions.length, 0); assert.equal(f.requests.length, 0);
+  await f.assertPrivate(refs);
+});
+
+test('notification references and in-flight conversation lookups stay bound to the trusted session and account generation', deadline, async t => {
+  const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
+  const initial: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+  const notice = async () => (await f.call('bilibili_notifications', { source: 'replies' })).result.data.items[0].notificationRef;
+  const notificationRef = await notice(), other = await f.app.sessions.create('Synthetic unrelated conversation viewer');
+  let before = (await fixture.stats()).calls.length;
+  assert.equal((await f.call('bilibili_replies', { notificationRef, sessionId: f.sessionId }, other)).result.error.code, 'reference_unavailable');
+  assert.equal((await fixture.stats()).calls.length, before);
+  await fixture.advance(86400000);
+  assert.equal((await f.call('bilibili_replies', { notificationRef })).result.error.code, 'reference_unavailable');
+  const freshRef = await notice();
+  await fixture.configure('comment-wait');
+  const pending = f.call('bilibili_replies', { notificationRef: freshRef });
+  await until(async () => (await fixture.stats()).waiting, 'the synthetic exact-comment lookup never started');
+  before = (await fixture.stats()).calls.filter((name: string) => name === 'thread').length;
+  const state: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: state.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+  await fixture.resume();
+  const stopped = await pending;
+  assert.equal(stopped.result.error.code, 'account_changed');
+  assert.equal((await fixture.stats()).calls.filter((name: string) => name === 'thread').length, before,
+    'an old-account exact comment response must not start the next request');
+  assert.ok(!JSON.stringify(stopped).includes('commentRef'));
+  assert.equal((await f.call('bilibili_replies', { notificationRef: freshRef })).result.error.code, 'reference_unavailable');
+  assert.equal((await fixture.stats()).submissions.length, 0); assert.equal(f.requests.length, 0);
+  await f.assertPrivate([notificationRef, freshRef]);
 });
 
 test('enabled interactions require full permission, deduplicate submissions and record one safe experience in the trusted session', deadline, async t => {
@@ -334,6 +451,92 @@ test('optional vision, no-audio default, native image blocks and recovery keep t
   assert.equal((await f.service('vision').stats()).offers, 1, 'the recovered binding cannot reuse the old provider reference');
   assert.equal(f.app.runtime.records.get('surf/bilibili').execution.pid, childPid);
   await f.assertPrivate([videoRef]);
+});
+
+test('history sync is an independent full tool using actual frame proofs, with no implicit write from safe watch', deadline, async t => {
+  const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture'), refs: string[] = [];
+  const initial: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+  await installVision(f); await until(() => f.names().includes('bilibili_watch'), 'watch was not registered');
+  const opened = await f.call('bilibili_open', { target: VIDEO_ID }), videoRef = opened.result.data.videoRef; refs.push(videoRef);
+  const watch = async (fromSeconds = 0, toSeconds = 5) => {
+    const result = await f.call('bilibili_watch', { videoRef, fromSeconds, toSeconds });
+    assert.equal(result.ok, true); const metadata = JSON.parse(result.result[0].text);
+    if (metadata.watchRef) refs.push(metadata.watchRef);
+    return { result, metadata };
+  };
+  assert.equal(f.app.tools.entries.get('bilibili_watch').danger, 'safe');
+  assert.equal((await watch()).metadata.watchRef, undefined);
+  assert.equal((await f.call('bilibili_mark_history', { watchRef: 'bili_watch_forged', operationId: 'synthetic-history' })).result.error.code, 'history_disabled');
+  const setHistory = async (enabled: boolean) => {
+    const settings: any = await (await f.request(prefix + '/config')).json();
+    assert.equal((await f.request(prefix + '/config', { revision: settings.revision, config: { ...settings.config, historySyncEnabled: enabled } })).status, 200);
+  };
+  await setHistory(true);
+  const status = await f.service().status(); assert.equal(status.historySyncEnabled, true); assert.equal(status.audioEnabled, false);
+  assert.equal(Object.values(status.interactions).every(value => value === false), true);
+  const watched = await watch(); assert.equal(watched.result.result[1].type, 'image');
+  assert.match(watched.metadata.watchRef, /^bili_watch_/);
+  assert.equal(watched.metadata.images[0].frames[0].atSeconds, 1.25);
+  assert.equal((await fixture.stats()).calls.some((name: string) => name.startsWith('history:')), false,
+    'enabling history or returning a frame cannot read or submit platform history');
+  const args = { watchRef: watched.metadata.watchRef, operationId: 'synthetic-history' };
+  assert.equal((await f.app.tools.call('bilibili_mark_history', args, { id: f.sessionId, permission: 'ask' })).ok, false);
+  const other = await f.app.sessions.create('Synthetic other history viewer');
+  assert.equal((await f.call('bilibili_mark_history', args, other)).result.error.code, 'reference_unavailable');
+  assert.equal((await fixture.stats()).historyPosts.length, 0);
+  const marked = await f.call('bilibili_mark_history', args);
+  assert.equal(marked.result.status, 'ok'); assert.equal(marked.result.data.state, 'verified');
+  assert.equal(marked.result.data.positionSeconds, 1, 'the requested end 5 seconds is not watched progress');
+  assert.equal(marked.result.data.experienceRecorded, true);
+  assert.deepEqual((await fixture.stats()).historyPosts, [{ aid: 12345, cid: 67890, positionSeconds: 1 }]);
+  const experiences = async () => (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((record: any) => record.origin?.action === 'history');
+  const saved = await experiences(); assert.equal(saved.length, 1);
+  assert.equal(saved[0].text, '在 B 站同步了一次视频采样位置，历史回读已确认。');
+  assert.equal((await f.call('bilibili_mark_history', args)).result.data.duplicate, true);
+  assert.equal((await fixture.stats()).historyPosts.length, 1); assert.equal((await experiences()).length, 1);
+  const later = await watch(5, 10);
+  await setHistory(false); await setHistory(true);
+  assert.equal((await f.call('bilibili_mark_history', { watchRef: later.metadata.watchRef, operationId: 'after-toggle' })).result.error.code, 'reference_unavailable');
+  await f.service('vision').configure('empty');
+  assert.equal((await watch(5, 10)).metadata.watchRef, undefined, 'metadata without real image blocks cannot issue proof');
+  assert.equal((await fixture.stats()).historyPosts.length, 1);
+  assert.equal((await f.service('vision').stats()).understands, 0);
+  assert.equal(f.requests.length, 0);
+  const pluginData = await diskText(join(f.bilibili, 'data'));
+  for (const marker of [...refs, RAW_TITLE, PRIVATE_MEDIA_REF, 'synthetic-history']) assert.ok(!pluginData.includes(marker));
+  await f.assertPrivate(refs);
+});
+
+test('accepted or uncertain history outcomes survive the process boundary and plugin reload without repeated writes', deadline, async t => {
+  for (const scenario of ['history-readback-fail', 'history-uncertain']) {
+    const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
+    const initial: any = await (await f.request(prefix + '/state')).json();
+    assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+    const config: any = await (await f.request(prefix + '/config')).json();
+    assert.equal((await f.request(prefix + '/config', { revision: config.revision, config: { ...config.config, historySyncEnabled: true } })).status, 200);
+    await installVision(f); await until(() => f.names().includes('bilibili_watch'), 'watch was not registered');
+    const proof = async () => {
+      const videoRef = (await f.call('bilibili_open', { target: VIDEO_ID })).result.data.videoRef;
+      const output = await f.call('bilibili_watch', { videoRef, fromSeconds: 0, toSeconds: 5 });
+      return JSON.parse(output.result[0].text).watchRef;
+    };
+    await fixture.configure(scenario); const watchRef = await proof();
+    const expected = scenario === 'history-uncertain' ? 'uncertain' : 'accepted';
+    const args = { watchRef, operationId: 'synthetic-history-' + scenario };
+    const first = await f.call('bilibili_mark_history', args); assert.equal(first.result.data.state, expected);
+    assert.equal((await f.call('bilibili_mark_history', { ...args, operationId: args.operationId + '-duplicate' })).result.data.state, expected);
+    assert.equal((await fixture.stats()).historyPosts.length, 1);
+    const episodes = (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((record: any) => record.origin?.action === 'history');
+    assert.equal(episodes.length, 0, 'acceptance without matching history must not be remembered as verified');
+    await f.app.runtime.action('surf/bilibili', 'reload');
+    await until(() => f.names().includes('bilibili_watch'), 'watch did not recover after child reload');
+    const fresh = await proof();
+    const after = await f.call('bilibili_mark_history', { ...args, watchRef: fresh });
+    assert.equal(after.result.data.state, expected); assert.equal(after.result.data.duplicate, true);
+    assert.equal((await f.service('bilibili-test-fixture').stats()).historyPosts.length, 0);
+    assert.equal(f.requests.length, 0); await f.assertPrivate([watchRef, fresh, args.operationId]);
+  }
 });
 
 test('parent stop cancels in-flight work; child independently stops and never replays on recovery', deadline, async t => {

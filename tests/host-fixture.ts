@@ -21,6 +21,8 @@ export const RAW_SUBTITLE = 'SYNTHETIC_BILI_FOREIGN_SUBTITLE_DO_NOT_PERSIST';
 export const RAW_AUDIO = 'SYNTHETIC_BILI_FOREIGN_AUDIO_DO_NOT_PERSIST';
 export const RAW_NOTIFICATION_REPLY = 'SYNTHETIC_BILI_NOTIFICATION_REPLY_DO_NOT_PERSIST';
 export const RAW_NOTIFICATION_LIKE = 'SYNTHETIC_BILI_NOTIFICATION_LIKE_DO_NOT_PERSIST';
+export const RAW_THREAD_ROOT = 'SYNTHETIC_BILI_THREAD_ROOT_DO_NOT_PERSIST';
+export const RAW_THREAD_REPLY = 'SYNTHETIC_BILI_THREAD_REPLY_DO_NOT_PERSIST';
 export const PRIVATE_NOTIFICATION_CURSOR = '90071992547409939';
 export const PRIVATE_QUERY = 'SYNTHETIC_BILI_PRIVATE_QUERY_DO_NOT_PERSIST';
 export const ERROR_SECRET = 'SYNTHETIC_BILI_ERROR_SECRET_DO_NOT_PERSIST';
@@ -113,13 +115,18 @@ export async function hostFixture(t: TestContext, baseline = CURRENT_HOST) {
 import { applyWithDependencies } from ${JSON.stringify(pathToFileURL(join(root, 'src/index.ts')).href)};
 import { BiliError } from ${JSON.stringify(pathToFileURL(join(root, 'src/errors.ts')).href)};
 export async function apply(ctx) {
-  let now = Date.now(), calls = [], waiting = false, cancelled = 0, disposed = false;
+  let now = Date.now(), calls = [], waiting = false, cancelled = 0, disposed = false, scenario = 'normal', resume;
+  const submissions = [], historyPosts = []; let historyProgress = {found:false};
   const video = { bvid: ${JSON.stringify(VIDEO_ID)}, aid: 12345, cid: 67890,
     title: ${JSON.stringify(RAW_TITLE)}, description: ${JSON.stringify(RAW_DESCRIPTION)},
     owner: { mid: 9988, name: 'Synthetic creator' }, duration: 120,
     cover: 'https://synthetic.bili.example/cover.jpg', url: ${JSON.stringify(VIDEO_URL)},
     parts: [{ cid: 67890, page: 1, title: 'Synthetic part', duration: 120 }] };
   const record = (name, options) => { options.signal?.throwIfAborted(); calls.push(name); };
+  const rootComment = () => ({aid:12345,rpid:'90071992547409930',root:'0',parent:'0',
+    text:${JSON.stringify(RAW_THREAD_ROOT)},author:{mid:1122,name:'Synthetic root author'},likes:2});
+  const replyComment = () => ({aid:12345,rpid:'90071992547409931',root:'90071992547409930',parent:'90071992547409930',
+    text:${JSON.stringify(RAW_THREAD_REPLY)},author:{mid:1122,name:'Synthetic reply author'},likes:1});
   const client = {
     async feed(source, page, cursor, options) { record('feed:' + source, options);
       if (source === 'following' && !options.cookie) throw new BiliError('login_required');
@@ -136,10 +143,43 @@ export async function apply(ctx) {
       }
       if (query === 'error') throw Error(${JSON.stringify(ERROR_SECRET)});
       return { items: [video], hasMore: false }; },
-    async video(target, options) { record('video', options); return video; },
+    async video(target, options) { record('video', options); return scenario==='video-aid'?{...video,aid:54321}:video; },
     async comments(aid, page, options) { record('comments', options); return { items: [
       { rpid:'90071992547409930', root:'0', text:${JSON.stringify(RAW_COMMENT)}, author:{mid:1122,name:'Synthetic reader'}, likes:2 }
     ], hasMore:false }; },
+    async comment(aid, rpid, options) {
+      record('comment', options);
+      if(scenario==='comment-wait') { waiting=true;await new Promise(resolve=>{resume=resolve;});waiting=false; }
+      const result=rpid==='90071992547409930'?rootComment():replyComment();
+      if(scenario==='comment-aid') result.aid=54321;
+      if(scenario==='comment-rpid') result.rpid='90071992547409932';
+      if(scenario==='comment-root') result.root='90071992547409933';
+      if(scenario==='comment-author') result.author.mid=7788;
+      if(scenario==='comment-missing') throw new BiliError('reference_unavailable');
+      return result;
+    },
+    async thread(aid, root, page, options) {
+      record('thread', options);
+      const original=rootComment(),reply=replyComment();
+      if(scenario==='thread-aid') reply.aid=54321;
+      if(scenario==='thread-root') reply.root='90071992547409933';
+      if(scenario==='thread-root-author') original.author.mid=7788;
+      if(scenario==='thread-target-author') reply.author.mid=7788;
+      return {root:original,items:page===1?[reply]:[{...reply,rpid:'90071992547409932',parent:reply.rpid}],
+        hasMore:page===1,...(page===1?{nextPage:2}:{})};
+    },
+    async historyProgress(target, options) {
+      record('history:progress', options);
+      if(scenario==='history-readback-fail' && historyPosts.length) throw new BiliError('network_error');
+      return historyProgress;
+    },
+    async reportHistoryPosition(input, options) {
+      record('history:report', options); historyPosts.push({...input});
+      if(scenario==='history-uncertain') throw new BiliError('uncertain');
+      if(scenario==='history-rejected') throw new BiliError('platform_error');
+      historyProgress={found:true,progressSeconds:input.positionSeconds,completed:false};
+      return {state:'accepted'};
+    },
     async notifications(source, cursor, options) {
       record('notifications:' + source, options);
       if (!options.cookie) throw new BiliError('login_required');
@@ -148,8 +188,10 @@ export async function apply(ctx) {
       return { items: [{id:cursor?'2002':'2001',actors:[{mid:1122,name:'Synthetic notification actor'}],time:1234,
         type:'reply',business:'comment',title:${JSON.stringify(RAW_TITLE)},
         text:source==='replies'?${JSON.stringify(RAW_NOTIFICATION_REPLY)}:${JSON.stringify(RAW_NOTIFICATION_LIKE)},
-        originalText:${JSON.stringify(RAW_COMMENT)},uri:${JSON.stringify(VIDEO_URL)},videoTarget:${JSON.stringify(VIDEO_ID)},
-        ...(source==='likes'?{likeCount:2}:{})}],hasMore:!cursor,
+        originalText:${JSON.stringify(RAW_COMMENT)},
+        ...(scenario==='notification-unknown'?{type:'article'}:{uri:${JSON.stringify(VIDEO_URL)},videoTarget:${JSON.stringify(VIDEO_ID)}}),
+        ...(source==='likes'?{likeCount:2}:scenario==='notification-unknown'||scenario==='notification-unverified'?{}:
+          {target:{aid:12345,rpid:scenario==='thread-root-author'?'90071992547409930':'90071992547409931',root:'90071992547409930',authorMid:1122}})}],hasMore:!cursor,
         ...(!cursor?{cursor:{id:${JSON.stringify(PRIVATE_NOTIFICATION_CURSOR)},time:1234}}:{}) };
     },
     async subtitles(bvid, cid, options) { record('subtitles', options); return { tracks:[{id:'1',language:'zh-CN',label:'Synthetic Chinese',url:'https://synthetic.bili.example/subtitle.json'}],loginRequired:false }; },
@@ -160,10 +202,13 @@ export async function apply(ctx) {
     async beginLogin(options) { record('beginLogin', options); return {url:'https://passport.bilibili.com/synthetic-login',key:'synthetic-qr-key'}; },
     async pollLogin(key, options) { record('pollLogin', options); return {state:'waiting'}; },
     async folders(mid, options) { record('folders', options); return [{id:'7',title:'Synthetic folder'}]; },
-    async interact(input, options) { record('interact', options); return {state:'confirmed',platformId:'123456789'}; },
+    async interact(input, options) { record('interact', options);
+      submissions.push({action:input.action,aid:input.aid,mid:input.mid,root:input.root,parent:input.parent});
+      return {state:'confirmed',platformId:'123456789'}; },
     dispose() { disposed = true; }
   };
-  ctx.provide('bilibili-test-fixture', {stats:()=>({calls,waiting,cancelled,disposed,pid:process.pid}),advance:milliseconds=>{now+=milliseconds;}});
+  ctx.provide('bilibili-test-fixture', {stats:()=>({calls,submissions,historyPosts,waiting,cancelled,disposed,pid:process.pid}),
+    advance:milliseconds=>{now+=milliseconds;},configure:value=>{scenario=value;},resume:()=>{resume?.();resume=undefined;}});
   return applyWithDependencies(ctx, {client, now:()=>now});
 }`);
   const load = async (id: string) => {
@@ -190,7 +235,7 @@ export async function apply(ctx) {
   const assertPrivate = async (extra: string[] = []) => {
     await app.runtime.events.drain();
     await app.memory.queue;
-    const markers = [RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE,
+    const markers = [RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY,
       PRIVATE_NOTIFICATION_CURSOR, PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF,
       SYNTHETIC_COOKIE, 'SYNTHETIC_BILI_SESSION_SECRET', ...extra];
     for (const directory of ['memory', 'logs']) {
@@ -205,20 +250,21 @@ export async function apply(ctx) {
 
 export async function installVision(f: Awaited<ReturnType<typeof hostFixture>>) {
   await f.plugin('vision', `export function apply(ctx) {
-    let offers=0, prepares=0, understands=0, releases=0, lastSession;
+    let offers=0, prepares=0, understands=0, releases=0, lastSession,mode='normal';
     // A synthetic JPEG signature exercises the host transport; decoding belongs to vision's own tests.
-    const prepared=()=>({images:[{mime:'image/jpeg',base64:Buffer.from([255,216,255,224,0,2,255,217]).toString('base64'),width:1,height:1,frames:[{atSeconds:1}]}],
-      coverage:{fromSeconds:0,toSeconds:30,timelineComplete:false},warnings:[]});
+    const prepared=input=>({images:mode==='empty'?[]:[{mime:'image/jpeg',base64:Buffer.from([255,216,255,224,0,2,255,217]).toString('base64'),width:1,height:1,
+      frames:[{atSeconds:input.fromSeconds+Math.min(1.25,(input.toSeconds-input.fromSeconds)/2)}]}],
+      coverage:{fromSeconds:input.fromSeconds,toSeconds:input.toSeconds,timelineComplete:false},warnings:[]});
     ctx.provide('vision', {
       audiovisualApiVersion:'1.0.0', status:()=>({audiovisualApiVersion:'1.0.0'}),
       async offerMedia(input, options) { options?.signal?.throwIfAborted(); offers++;lastSession=input.sessionId;
         if(input.mime!=='video/mp4'||!input.base64) throw Error('Malformed synthetic source media');
         return {mediaRef:${JSON.stringify(PRIVATE_MEDIA_REF)},expiresAt:new Date(Date.now()+600000).toISOString(),info:{kind:'video',hasAudio:true}}; },
-      async prepare(input, options) { options?.signal?.throwIfAborted(); prepares++;lastSession=input.sessionId;return prepared(); },
+      async prepare(input, options) { options?.signal?.throwIfAborted(); prepares++;lastSession=input.sessionId;return prepared(input); },
       async understand(input, options) { options?.signal?.throwIfAborted(); understands++;lastSession=input.sessionId;
-        return {status:'completed',visual:prepared(),audio:{status:'completed',evidence:${JSON.stringify(RAW_AUDIO)}}}; },
+        return {status:'completed',visual:prepared(input),audio:{status:'completed',evidence:${JSON.stringify(RAW_AUDIO)}}}; },
       async release() { releases++;return {released:true}; },
-      stats:()=>({offers,prepares,understands,releases,lastSession,pid:process.pid})
+      stats:()=>({offers,prepares,understands,releases,lastSession,pid:process.pid}),configure:value=>{mode=value;}
     });
   }`);
   await f.load('vision');

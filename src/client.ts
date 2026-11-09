@@ -4,10 +4,12 @@
  */
 import { BiliError } from './errors.ts';
 import { validateLoginUrl } from './login-url.ts';
+import { readHistoryProgress, reportHistoryPosition } from './history-client.ts';
+import type { HistoryTarget, HistoryPositionInput } from './history-client.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
-  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, NotificationSource, NotificationCursor, NotificationItem, NotificationList } from './types.ts';
+  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
 
 const API = 'https://api.bilibili.com';
 const PASSPORT = 'https://passport.bilibili.com';
@@ -83,6 +85,14 @@ function notificationLocation(value: unknown, type: string): { uri?: string; vid
     return match ? { uri: `https://www.bilibili.com/video/${match[1]}/`, videoTarget: match[1] } : { uri: url.href };
   } catch { return {}; }
 }
+function notificationTarget(item: Record<string, any>, actorMid: number, videoTarget?: string): NotificationItem['target'] {
+  if (item.type !== 'reply' || item.business_id !== 1 || !videoTarget) return undefined;
+  try {
+    const aid = integer(item.subject_id), rpid = identifier(item.source_id), rawRoot = identifier(item.root_id, true);
+    if (videoTarget.startsWith('av') && integer(videoTarget.slice(2)) !== aid) return undefined;
+    return { aid, rpid, root: /^0+$/.test(rawRoot) ? rpid : rawRoot, authorMid: actorMid };
+  } catch { return undefined; }
+}
 function notification(raw: unknown, source: NotificationSource): NotificationItem {
   const value = record(raw), item = record(value.item);
   if (typeof item.type !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(item.type)) throw new BiliError('malformed_response');
@@ -95,12 +105,47 @@ function notification(raw: unknown, source: NotificationSource): NotificationIte
   });
   if (source === 'replies' && typeof item.source_content !== 'string') throw new BiliError('malformed_response');
   const title = notificationText(item.title) || notificationText(item.desc);
+  const location = notificationLocation(item.uri, item.type);
+  const target = source === 'replies' ? notificationTarget(item, actors[0]!.mid, location.videoTarget) : undefined;
   return { id: identifier(value.id), actors, time: notificationNumber(source === 'replies' ? value.reply_time : value.like_time),
     type: item.type, business: notificationText(item.business, 100), title,
     text: source === 'replies' ? notificationText(item.source_content) : title,
     originalText: notificationText(item.target_reply_content) || notificationText(item.root_reply_content),
-    ...notificationLocation(item.uri, item.type),
+    ...location, ...(target ? { target } : {}),
     ...(source === 'likes' ? { likeCount: notificationNumber(value.counts) } : {}) };
+}
+function checkedCommentId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[1-9]\d{0,19}$/.test(value)) throw new BiliError('invalid_input');
+  return value;
+}
+function responseId(raw: Record<string, any>, field: string, zero = false): string {
+  const preferred = raw[field + '_str'];
+  if (preferred !== undefined && typeof preferred !== 'string') throw new BiliError('malformed_response');
+  const id = identifier(preferred ?? raw[field], zero);
+  // A decimal string retains identifiers which exceed JS integer precision. Safe numeric copies must still agree.
+  if (preferred !== undefined && raw[field] !== undefined) {
+    if (typeof raw[field] === 'number' ? !Number.isInteger(raw[field]) || Number.isSafeInteger(raw[field]) && String(raw[field]) !== id
+      : typeof raw[field] !== 'string' || raw[field] !== id) throw new BiliError('malformed_response');
+  }
+  return id;
+}
+function threadComment(raw: unknown, aid: number): ThreadComment {
+  const value = record(raw), member = record(value.member), content = record(value.content);
+  if (value.type !== 1 || integer(responseId(value, 'oid')) !== aid) throw new BiliError('malformed_response');
+  if (typeof value.invisible !== 'boolean' || typeof value.state !== 'number' || !Number.isSafeInteger(value.state)) throw new BiliError('malformed_response');
+  if (value.invisible || value.state !== 0) throw new BiliError('reference_unavailable');
+  const rpid = responseId(value, 'rpid'), root = responseId(value, 'root', true), parent = responseId(value, 'parent', true);
+  if (root === '0' ? parent !== '0' : parent === '0' || root === rpid || parent === rpid) throw new BiliError('malformed_response');
+  const mid = integer(member.mid);
+  if (value.mid !== undefined || value.mid_str !== undefined) {
+    if (integer(responseId(value, 'mid')) !== mid) throw new BiliError('malformed_response');
+  }
+  if (typeof member.uname !== 'string' || !member.uname.trim() || typeof content.message !== 'string') throw new BiliError('malformed_response');
+  return { aid, rpid, root, parent, text: plain(content.message, 4000), author: { mid, name: plain(member.uname, 200) }, likes: notificationNumber(value.like) };
+}
+function threadFailure(error: unknown): never {
+  if (error instanceof BiliError && ['reference_unavailable', 'too_large'].includes(error.code)) throw error;
+  throw new BiliError('malformed_response');
 }
 function checkedCookie(value: string | undefined) {
   if (!value) return '';
@@ -140,6 +185,12 @@ export class BiliClient implements BiliClientContract {
     const timeoutMs = options.timeoutMs ?? 20000;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 240000) throw new BiliError('invalid_input');
     return { signal: AbortSignal.any([this.signal, ...(options.signal ? [options.signal] : [])]), timeoutMs };
+  }
+  historyProgress(target: HistoryTarget, options: CallOptions) {
+    return readHistoryProgress(this.transport, target, { ...options, ...this.options(options) });
+  }
+  reportHistoryPosition(input: HistoryPositionInput, options: CallOptions) {
+    return reportHistoryPosition(this.transport, input, { ...options, ...this.options(options) });
   }
   private async request(path: string, params: Record<string, string>, options: CallOptions, passport = false) {
     const url = new URL(path, passport ? PASSPORT : API); url.search = new URLSearchParams(params).toString();
@@ -239,6 +290,35 @@ export class BiliClient implements BiliClientContract {
     const info = record(data.page); const total = Number(info.count); const size = Number(info.size ?? 20);
     const hasMore = Number.isFinite(total) && Number.isFinite(size) && size > 0 && page * size < total;
     return { items, hasMore, ...(hasMore ? { nextPage: page + 1 } : {}) };
+  }
+  async comment(aid: number, rpid: string, options: CallOptions): Promise<ThreadComment> {
+    if (typeof aid !== 'number') throw new BiliError('invalid_input'); integer(aid); checkedCommentId(rpid);
+    // The official detail response calls the selected row "root", including when the selected rpid is a child reply.
+    const data = apiData(await this.request('/x/v2/reply/detail', { type: '1', oid: String(aid), root: rpid }, options));
+    try {
+      if (data.root === null) throw new BiliError('reference_unavailable');
+      const found = threadComment(data.root, aid);
+      if (found.rpid !== rpid) throw new BiliError('malformed_response');
+      return found;
+    } catch (error) { return threadFailure(error); }
+  }
+  async thread(aid: number, root: string, page: number, options: CallOptions): Promise<CommentThread> {
+    if (typeof aid !== 'number' || typeof page !== 'number') throw new BiliError('invalid_input'); integer(aid); checkedCommentId(root); pageNumber(page);
+    const data = apiData(await this.request('/x/v2/reply/reply', { type: '1', oid: String(aid), root, pn: String(page), ps: '20' }, options));
+    try {
+      if (data.root === null) throw new BiliError('reference_unavailable');
+      const found = threadComment(data.root, aid);
+      if (found.rpid !== root || found.root !== '0' || found.parent !== '0') throw new BiliError('malformed_response');
+      const info = record(data.page), num = notificationNumber(info.num, 1), size = notificationNumber(info.size, 1), count = notificationNumber(info.count);
+      if (num !== page || size > 100) throw new BiliError('malformed_response');
+      const rows = notificationItems(data.replies);
+      if (rows.length > 20 || rows.length > size) throw new BiliError('too_large');
+      const items = rows.map(row => threadComment(row, aid));
+      if (items.some(item => item.root !== root || item.rpid === root) || new Set(items.map(item => item.rpid)).size !== items.length) throw new BiliError('malformed_response');
+      const hasMore = page * size < count;
+      if (hasMore && !items.length) throw new BiliError('malformed_response');
+      return { root: found, items, hasMore, ...(hasMore ? { nextPage: page + 1 } : {}) };
+    } catch (error) { return threadFailure(error); }
   }
   async notifications(source: NotificationSource, cursor: NotificationCursor | undefined, options: CallOptions): Promise<NotificationList> {
     if (source !== 'replies' && source !== 'likes') throw new BiliError('invalid_input');

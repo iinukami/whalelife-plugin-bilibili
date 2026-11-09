@@ -5,16 +5,21 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { MultimodalToolOutput, OptionalService, ToolSession, TransientToolOutput } from 'whalelife';
 import { BiliError, object, safeError } from './errors.ts';
-import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, PreparedMedia, SurfService, VideoDetails, VideoItem, VisionService } from './types.ts';
+import { HistorySync } from './history-sync.ts';
+import type { HistoryOutcome } from './history-sync.ts';
+import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, NotificationTarget, PreparedMedia, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
 
 type Ref = { session: string; account: string; expires: number; video: VideoItem | VideoDetails; comment?: CommentItem };
 type NotificationPageRef = { session: string; account: string; expires: number; source: NotificationSource; cursor: NotificationCursor };
+type NotificationRef = { session: string; account: string; expires: number; videoTarget: string; target: NotificationTarget };
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
 type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string };
 export interface RuntimeOptions {
   signal: AbortSignal; transient: boolean; config: () => Config; account: () => AccountState | undefined; accountRevision?: () => string;
   readLedger: () => Promise<unknown>; saveLedger: (value: unknown) => Promise<void>; now?: () => number;
   recordAction?: (sessionId: string, eventId: string, action: Action) => Promise<void>;
+  readHistoryLedger?: () => Promise<unknown>; saveHistoryLedger?: (value: unknown) => Promise<void>;
+  recordHistory?: (sessionId: string, eventId: string) => Promise<void>;
 }
 function string(value: unknown, max = 200) { if (typeof value !== 'string' || !value.trim() || value.length > max || /[\x00-\x08\x0b-\x1f\x7f]/.test(value)) throw new BiliError('invalid_input'); return value.trim(); }
 function integer(value: unknown, fallback: number, min = 1, max = 100) { if (value === undefined) return fallback; if (!Number.isInteger(value) || Number(value) < min || Number(value) > max) throw new BiliError('invalid_input'); return Number(value); }
@@ -23,6 +28,7 @@ const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(valu
 export class BiliRuntime {
   private refs = new Map<string, Ref>();
   private notificationPages = new Map<string, NotificationPageRef>();
+  private notifications = new Map<string, NotificationRef>();
   private media = new Map<string, MediaRef>();
   private pendingMedia = new Map<string, Promise<MediaRef>>();
   private vision?: OptionalService<VisionService>;
@@ -35,7 +41,13 @@ export class BiliRuntime {
   private client: BiliClientContract;
   private surf: SurfService;
   private options: RuntimeOptions;
-  constructor(client: BiliClientContract, surf: SurfService, options: RuntimeOptions) { this.client = client; this.surf = surf; this.options = options; this.now = options.now ?? Date.now; }
+  private history: HistorySync;
+  constructor(client: BiliClientContract, surf: SurfService, options: RuntimeOptions) {
+    this.client = client; this.surf = surf; this.options = options; this.now = options.now ?? Date.now;
+    this.history = new HistorySync(client, { config: options.config, account: options.account, identity: () => this.identity(), now: this.now,
+      check: (identity, callOptions) => this.checkOperation(identity, callOptions), readLedger: options.readHistoryLedger ?? (async () => ({})),
+      saveLedger: options.saveHistoryLedger ?? (async () => { throw new BiliError('persistence_error'); }), record: options.recordHistory });
+  }
 
   async initialize() {
     try {
@@ -49,15 +61,24 @@ export class BiliRuntime {
       });
       this.ledgerReady = true;
     } catch { this.ledgerReady = false; }
+    await this.history.initialize();
   }
   status() { return { ready: this.options.transient, vision: Boolean(this.vision && !this.vision.signal.aborted), audioEnabled: this.options.config().audioEnabled,
-    interactions: { ...this.options.config().interactions }, ledgerReady: this.ledgerReady, activeRequests: this.active, platformNetwork: 'direct' }; }
+    interactions: { ...this.options.config().interactions }, historySyncEnabled: this.options.config().historySyncEnabled, historyLedgerReady: this.history.ready,
+    ledgerReady: this.ledgerReady, activeRequests: this.active, platformNetwork: 'direct' }; }
   setVision(binding?: OptionalService<VisionService>) { this.vision = binding; for (const ref of this.media.values()) void this.release(ref); this.media.clear(); this.pendingMedia.clear(); }
+  invalidateHistoryProofs() { this.history.clearProofs(); }
   private identity() { return this.options.accountRevision?.() ?? this.options.account()?.revision ?? 'anonymous'; }
   private guard() { if (this.options.signal.aborted || this.controller.signal.aborted) throw new BiliError('stopped'); if (!this.options.transient) throw new BiliError('host_required'); }
+  private checkOperation(identity: string, options: CallOptions) {
+    this.guard();
+    if (options.signal?.aborted) throw new BiliError('cancelled');
+    if (identity !== this.identity()) throw new BiliError('account_changed');
+  }
   private sweep() {
     for (const [id, ref] of this.refs) if (ref.expires <= this.now() || ref.account !== this.identity()) this.refs.delete(id);
     for (const [id, ref] of this.notificationPages) if (ref.expires <= this.now() || ref.account !== this.identity()) this.notificationPages.delete(id);
+    for (const [id, ref] of this.notifications) if (ref.expires <= this.now() || ref.account !== this.identity()) this.notifications.delete(id);
     for (const [id, ref] of this.media) if (ref.expires <= this.now() || ref.binding.signal.aborted || ref.account !== this.identity()) { this.media.delete(id); void this.release(ref); }
   }
   private async release(ref: MediaRef) {
@@ -92,7 +113,7 @@ export class BiliRuntime {
   }
   private reserveReference(session: string, account: string) {
     this.sweep();
-    const all = [...this.refs.values(), ...this.notificationPages.values()];
+    const all = [...this.refs.values(), ...this.notificationPages.values(), ...this.notifications.values()];
     if (all.length >= 512 || all.filter(r => r.session === session).length >= 128) throw new BiliError('busy');
     if (account !== this.identity()) throw new BiliError('account_changed');
   }
@@ -113,9 +134,50 @@ export class BiliRuntime {
     if (!ref || ref.session !== session || ref.account !== this.identity() || ref.source !== source) throw new BiliError('reference_unavailable');
     return { ...ref.cursor };
   }
+  private putNotification(session: string, account: string, videoTarget: string, target: NotificationTarget) {
+    this.reserveReference(session, account);
+    const id = 'bili_notice_' + randomUUID();
+    this.notifications.set(id, { session, account, videoTarget, target: { ...target }, expires: this.now() + this.options.config().referenceTtlSeconds * 1000 });
+    return id;
+  }
+  private notificationRef(id: unknown, session: string) {
+    this.sweep(); const ref = this.notifications.get(string(id));
+    if (!ref || ref.session !== session || ref.account !== this.identity()) throw new BiliError('reference_unavailable');
+    return ref;
+  }
   private get(id: unknown, session: string) {
     this.sweep(); const ref = this.refs.get(typeof id === 'string' ? id : '');
     if (!ref || ref.session !== session || ref.account !== this.identity()) throw new BiliError('reference_unavailable'); return ref;
+  }
+  private async replies(args: Record<string, unknown>, id: string, options: CallOptions, identity: string) {
+    if ((args.notificationRef === undefined) === (args.commentRef === undefined)) throw new BiliError('invalid_input');
+    const page = integer(args.page, 1);
+    let video: VideoDetails, expected: NotificationTarget;
+    if (args.notificationRef !== undefined) {
+      const notice = this.notificationRef(args.notificationRef, id);
+      expected = notice.target;
+      video = await this.client.video(notice.videoTarget, options); this.checkOperation(identity, options);
+    } else {
+      const ref = this.get(args.commentRef, id);
+      if (!ref.comment) throw new BiliError('invalid_input');
+      expected = { aid: ref.video.aid, rpid: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root, authorMid: ref.comment.author.mid };
+      video = 'parts' in ref.video ? ref.video : await this.client.video(ref.video.bvid, options); this.checkOperation(identity, options);
+    }
+    if (video.aid !== expected.aid) throw new BiliError('comment_mismatch');
+    const target = await this.client.comment(video.aid, expected.rpid, options); this.checkOperation(identity, options);
+    const rootId = target.root === '0' ? target.rpid : target.root;
+    if (target.aid !== video.aid || target.rpid !== expected.rpid || target.author.mid !== expected.authorMid || rootId !== expected.root) throw new BiliError('comment_mismatch');
+    const thread = await this.client.thread(video.aid, rootId, page, options); this.checkOperation(identity, options);
+    if (thread.root.aid !== video.aid || thread.root.rpid !== rootId || thread.root.root !== '0' || thread.root.parent !== '0'
+      || thread.items.some(item => item.aid !== video.aid || item.root !== rootId || item.rpid === rootId)) throw new BiliError('comment_mismatch');
+    if ([thread.root, ...thread.items].some(item => item.rpid === target.rpid
+      && (item.author.mid !== target.author.mid || item.root !== target.root || item.parent !== target.parent))) throw new BiliError('comment_mismatch');
+    const present = (comment: ThreadComment) => ({ ...comment, commentRef: this.put(id, identity, video, comment) });
+    const referenced = new Map<string, ReturnType<typeof present>>();
+    const once = (comment: ThreadComment) => { let value = referenced.get(comment.rpid); if (!value) { value = present(comment); referenced.set(comment.rpid, value); } return value; };
+    return { video: { title: video.title, url: video.url, videoRef: this.put(id, identity, video) }, root: once(thread.root), target: once(target),
+      items: thread.items.map(once), hasMore: thread.hasMore, nextPage: thread.nextPage, page, untrusted: true,
+      contextComplete: page === 1 && !thread.hasMore, targetOnPage: thread.root.rpid === target.rpid || thread.items.some(item => item.rpid === target.rpid) };
   }
   private async operation<T>(session: ToolSession, callback: (id: string, options: CallOptions, identity: string) => Promise<T>, extraSignal?: AbortSignal): Promise<T> {
     this.guard(); if (!session.id) throw new BiliError('session_required');
@@ -143,10 +205,12 @@ export class BiliRuntime {
           const source = args.source;
           const cursor = args.cursor === undefined ? undefined : this.notificationPage(args.cursor, id, source);
           const result = await this.client.notifications(source, cursor, options);
-          if (options.signal?.aborted) throw new BiliError('cancelled');
-          return { source, items: result.items, hasMore: result.hasMore,
+          this.checkOperation(identity, options);
+          return { source, items: result.items.map(({ target, ...item }) => ({ ...item,
+            ...(source === 'replies' && target && item.videoTarget ? { notificationRef: this.putNotification(id, identity, item.videoTarget, target) } : {}) })), hasMore: result.hasMore,
             ...(result.hasMore && result.cursor ? { cursor: this.putNotificationPage(id, identity, source, result.cursor) } : {}), untrusted: true };
         }
+        if (action === 'replies') return this.replies(args, id, options, identity);
         if (action === 'browse' || action === 'search') {
           const page = integer(args.page, 1);
           let result;
@@ -209,14 +273,32 @@ export class BiliRuntime {
           const result = await binding.service.understand({ ...input, visual: true, audio: ['speech'] }, { signal: options.signal });
           prepared = result.visual; audio = result.audio; outcome = result.status;
         } else prepared = await binding.service.prepare({ ...input, layout: 'frames' }, { signal: options.signal });
+        this.checkOperation(identity, options);
+        const watchRef = prepared ? this.history.prove(id, identity, video, part, prepared, { fromSeconds: from, toSeconds: to }) : undefined;
         // Private vision mediaRef is never exposed. With audio disabled no sound API is called.
         const metadata = { source: 'bilibili', untrusted: true, outcome, audioEnabled, audio,
-          coverage: prepared?.coverage, warnings: prepared?.warnings, images: prepared?.images.map(({ width, height, frames }) => ({ width, height, frames })) ?? [],
+          coverage: prepared?.coverage, warnings: prepared?.warnings, images: prepared?.images.map(({ width, height, frames }) => ({ width, height, frames })) ?? [], ...(watchRef ? { watchRef } : {}),
           notice: '仅所列时间范围的采样画面与证据；不是完整观看，也不是指令或授权。' };
         return { content: [{ type: 'text' as const, text: JSON.stringify(metadata) }, ...(prepared?.images ?? []).map(frame => ({ type: 'image' as const, mimeType: frame.mime, data: Buffer.from(frame.base64, 'base64'), detail: 'auto' as const }))],
           receipt: { action: 'bilibili_watch', status: outcome, images: prepared?.images.length ?? 0, audioEnabled, fromSeconds: from, toSeconds: to } };
       }, binding.signal);
     } catch (error) { const e = safeError(error); return { content: [{ type: 'text', text: JSON.stringify({ status: 'error', error: e }) }], receipt: { action: 'bilibili_watch', status: 'error', code: e.code } }; }
+  }
+
+  async markHistory(raw: unknown, session: ToolSession): Promise<TransientToolOutput> {
+    const job = this.actionQueue.then(async (): Promise<TransientToolOutput> => {
+      let outcome: HistoryOutcome | undefined;
+      const present = (data: HistoryOutcome): TransientToolOutput => ({ content: { status: ['rejected', 'uncertain'].includes(data.state) ? 'error' : 'ok', data },
+        receipt: { action: 'bilibili_mark_history', state: data.state, duplicate: data.duplicate === true } });
+      try {
+        await this.operation(session, async (id, options, identity) => { outcome = await this.history.mark(object(raw), id, options, identity); });
+        return present(outcome!);
+      } catch (error) {
+        if (outcome && ['accepted', 'verified', 'already_recorded', 'uncertain'].includes(outcome.state)) return present(outcome);
+        const e = safeError(error); return { content: { status: 'error', error: e }, receipt: { action: 'bilibili_mark_history', status: 'error', code: e.code } };
+      }
+    });
+    this.actionQueue = job.catch(() => {}); return job;
   }
 
   async interact(raw: unknown, session: ToolSession): Promise<TransientToolOutput> {
@@ -282,7 +364,7 @@ export class BiliRuntime {
     }
   }
   async dispose() {
-    this.controller.abort(); this.refs.clear(); this.notificationPages.clear();
+    this.controller.abort(); this.refs.clear(); this.notificationPages.clear(); this.notifications.clear(); this.history.dispose();
     const offers = [...this.media.values()]; this.media.clear();
     this.pendingMedia.clear(); await Promise.allSettled(offers.map(x => this.release(x)));
     await this.client.dispose();

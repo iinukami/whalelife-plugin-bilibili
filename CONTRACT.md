@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.1.4，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.1.5，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -11,19 +11,27 @@
 | bilibili_open | target为普通视频URL/BV/av号/短链；返回资料、分P及videoRef |
 | bilibili_comments | videoRef、可选page；返回临时评论和commentRef |
 | bilibili_notifications | source=`replies|likes`，可选cursor；需登录，按需读取“回复我的”或“收到的赞”，下一页使用返回的同类cursor |
+| bilibili_replies | notificationRef或commentRef二选一，可选page；回查目标及所属视频后返回根评论、目标评论与当前页子回复 |
 | bilibili_subtitles | videoRef、part、language、offset；默认第一P、优先中文，返回最多60条时间轴字幕及nextOffset |
 | bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件及实际覆盖说明 |
+| bilibili_mark_history | watchRef、稳定operationId；需登录、historySyncEnabled与full权限，仅提交已有真实采样凭据对应的位置 |
 | bilibili_interact | action、operationId、videoRef或commentRef，以及评论/回复text；受独立开关、账号与full权限约束 |
 
 普通结果为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。不能用工具外层 `ok` 当作平台成功。互动结果明确 `confirmed|rejected|uncertain`，重复请求给 `duplicate:true`；pending重启记录视为uncertain，不发远端请求。稳定 operationId 及内容指纹共同防重发，记录中不保存评论正文或凭据。
 
 确认的互动通过 `memory.recordExperience` 记录固定动作说明；事件标识使用动作散列，重复补记幂等。记忆失败只影响 `experienceRecorded`，不把已经完成的外部动作重新提交。
 
-消息中心只读取列表，不后台轮询、主动提交已读或发送互动；互动开关关闭时仍可读取。通知的用户、正文、原内容与来源均仅作临时资料；聚合点赞只返回平台提供的用户列表，不承诺全部点赞者。普通视频来源的 `videoTarget` 可用于既有 open 工具，非视频来源不转换成视频或评论引用。通知不提供 `commentRef`，不扩展既有顶层评论读取为完整楼中楼。分页 cursor 为不透明内存引用，绑定可信会话、账号代际、来源及 TTL，与视频/评论引用共享容量上限；不接收模型拼装的平台原始分页字段。
+消息中心按需读取，不后台轮询、主动提交已读或发送互动；互动开关关闭时仍可读取。通知的用户、正文、原内容与来源均仅作临时资料；聚合点赞只返回平台提供的用户列表，不承诺全部点赞者。普通视频来源的 `videoTarget` 可用于既有 open 工具；有可靠定位信息的普通视频回复另返回 `notificationRef`。非视频、聚合点赞和定位不全的通知不生成评论入口。分页 cursor 和 notificationRef 为不透明内存引用，绑定可信会话、账号代际及 TTL，与视频/评论引用共享容量上限；不接收模型拼装的平台原始分页字段。
+
+`bilibili_replies` 通过评论详情核对 aid/rpid/root/作者，再读取根楼层页。`target` 始终是原始目标，即使其不在当前页；`targetOnPage` 单独说明这一点。`contextComplete` 仅在第一页且无更多页时为true，表示平台当前可见楼层页读完，不保证包含已删除或不可见内容。已删除、不可见、身份不符或异常响应不产生可用引用。继续回复用 `target.commentRef` 调用原有 interact/reply，root为所属根评论、parent为目标评论；仍受原有独立开关、full权限和持久防重发约束。
 
 引用只在内存中保存，默认600秒，单会话最多128、全局512；过期、账号代际变化及重载失效。匿名状态也绑定登录状态代际，登录后再退出不会恢复此前的匿名引用。字幕、简介、评论、标题和声音证据标为外部资料，没有指令权威。持久回执只含动作和状态；浏览结果、原文、URL、引用与图片不进入回执。最终助手正文遵守主干现行保存契约。
 
 `bilibili_watch` 消费 vision 的公开 `offerMedia/prepare/understand/release`，仅内部保留媒体引用。声音关闭仅调 `prepare`；开启要求 audiovisualApiVersion 1.0.0 与 understand 存在，显式 `audio:['speech']`。不另选主模型、不将base64当普通JSON交给模型、不代为收藏或发送。采样与语音后端失败准确呈现，部分成功不冒充全片理解。
+
+`historySyncEnabled` 默认false，旧配置缺字段按false迁移。开启且登录时，watch 的真实JPEG、逐帧时间及覆盖范围通过校验才生成 `watchRef`；只认实际帧最大时间戳向下取整，必须小于分P时长，不接受模型自填进度。此引用证明采样准备结果，不证明主模型已理解。观看引用独立上限为每会话32/总128，TTL沿用配置；过期、账号变化、关闭开关、重载后失效。容量不足只省略watchRef，不影响观看。
+
+历史写入使用独立持久记录和既有动作队列，先落pending再请求；同operationId改变内容拒绝，相同动作指纹防重，重启pending按uncertain处理。`accepted`仅表示接口接受；`verified`表示本次提交且历史回读位置不低于采样位置；`already_recorded`表示已有位置足够、没有提交；`rejected`是确定拒绝；`uncertain`不自动重发。只在submitted且verified后通过公开记忆接口写固定经历，补记失败不重发。近期历史查询限30条，缺席不证明没有旧记录；已知更高位置不回退，但不承诺发现更早历史或跨设备并发。POST只含aid/cid/progress/csrf，不发送观看心跳、播放时长或完成标记，不保证播放量。
 
 设置路径均位于 `/plugins/surf/bilibili/`，继承宿主鉴权与来源检查。GET settings/config/state/folders，POST config/login/start/login/poll/login/import/login/logout。配置与账号修改采用各自 revision，拒绝过期编辑；二维码只由本地编码器生成，登录密钥不返回状态。Cookie不随重定向传播到CDN。网络请求仅HTTPS、公网DNS校验并固定连接地址，压缩前后限量、限时、可取消，无自动业务重试。
 

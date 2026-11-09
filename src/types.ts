@@ -2,20 +2,24 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
  */
+import type { HistoryTarget, HistoryPositionInput, HistoryProgress } from './history-client.ts';
 export type Action = 'like' | 'favorite' | 'follow' | 'comment' | 'reply';
-export interface Config { audioEnabled: boolean; interactions: Record<Action, boolean>; favoriteFolderId: string; maxMediaBytes: number; referenceTtlSeconds: number }
+export interface Config { audioEnabled: boolean; historySyncEnabled: boolean; interactions: Record<Action, boolean>; favoriteFolderId: string; maxMediaBytes: number; referenceTtlSeconds: number }
 export interface CallOptions { signal?: AbortSignal; cookie?: string; timeoutMs?: number }
 export interface VideoItem { bvid: string; aid: number; title: string; owner: { mid: number; name: string }; duration: number; cover: string; url: string }
 export interface VideoDetails extends VideoItem { cid: number; description: string; parts: { cid: number; page: number; title: string; duration: number }[] }
 export interface VideoList { items: VideoItem[]; hasMore: boolean; cursor?: string; nextPage?: number }
 export interface CommentItem { rpid: string; root: string; text: string; author: { mid: number; name: string }; likes: number }
 export interface CommentList { items: CommentItem[]; hasMore: boolean; nextPage?: number }
+export interface ThreadComment extends CommentItem { aid: number; parent: string }
+export interface CommentThread { root: ThreadComment; items: ThreadComment[]; hasMore: boolean; nextPage?: number }
+export interface NotificationTarget { aid: number; rpid: string; root: string; authorMid: number }
 export type NotificationSource = 'replies' | 'likes';
 export interface NotificationCursor { id: string; time: number }
 export interface NotificationActor { mid: number; name: string }
 export interface NotificationItem {
   id: string; actors: NotificationActor[]; time: number; type: string; business: string;
-  title: string; text: string; originalText: string; uri?: string; videoTarget?: string; likeCount?: number;
+  title: string; text: string; originalText: string; uri?: string; videoTarget?: string; likeCount?: number; target?: NotificationTarget;
 }
 export interface NotificationList { items: NotificationItem[]; hasMore: boolean; cursor?: NotificationCursor }
 export interface SubtitleTrack { id: string; language: string; label: string; url: string }
@@ -28,6 +32,10 @@ export interface BiliClientContract {
   search(query: string, page: number, options: CallOptions): Promise<VideoList>;
   video(target: string, options: CallOptions): Promise<VideoDetails>;
   comments(aid: number, page: number, options: CallOptions): Promise<CommentList>;
+  comment(aid: number, rpid: string, options: CallOptions): Promise<ThreadComment>;
+  thread(aid: number, root: string, page: number, options: CallOptions): Promise<CommentThread>;
+  historyProgress(target: HistoryTarget, options: CallOptions): Promise<HistoryProgress>;
+  reportHistoryPosition(input: HistoryPositionInput, options: CallOptions): Promise<{ state: 'accepted' }>;
   notifications(source: NotificationSource, cursor: NotificationCursor | undefined, options: CallOptions): Promise<NotificationList>;
   subtitles(bvid: string, cid: number, options: CallOptions): Promise<{ tracks: SubtitleTrack[]; loginRequired: boolean }>;
   subtitle(url: string, options: CallOptions): Promise<SubtitleCue[]>;

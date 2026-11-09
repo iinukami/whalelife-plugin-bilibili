@@ -25,8 +25,9 @@ async function pageFixture(start: () => Promise<ReturnType<typeof response>>, po
   const events = new Map<string, () => void>();
   const timers = new Map<number, () => Promise<void>>();
   let nextTimer = 0;
-  const config = { audioEnabled: false, interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
+  let config = { audioEnabled: false, historySyncEnabled: false, interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
     maxMediaBytes: 67108864, referenceTtlSeconds: 600, favoriteFolderId: '' };
+  const saved: any[] = [];
   const script = /<script>([\s\S]*?)<\/script>/.exec(settingsPage)?.[1];
   assert.ok(script);
   await runInNewContext(script, {
@@ -35,17 +36,37 @@ async function pageFixture(start: () => Promise<ReturnType<typeof response>>, po
     Option: class { text: string; value: string; constructor(text: string, value: string) { this.text = text; this.value = value; } },
     setTimeout: (fn: () => Promise<void>) => { timers.set(++nextTimer, fn); return nextTimer; },
     clearTimeout: (id: number) => timers.delete(id),
-    fetch: async (url: string) => {
-      if (url.endsWith('/config')) return response({ ok: true, revision: 'synthetic-config', config });
+    fetch: async (url: string, init?: { method?: string; body?: string }) => {
+      if (url.endsWith('/config')) {
+        if (init?.method === 'POST') { const payload = JSON.parse(init.body!); saved.push(payload); config = payload.config; }
+        return response({ ok: true, revision: 'synthetic-config', config });
+      }
       if (url.endsWith('/state')) return response({ ok: true, account: { loggedIn: false, revision: 'synthetic-account' }, status: { ready: true, vision: true } });
       if (url.endsWith('/login/start')) return start();
       if (url.endsWith('/login/poll') && poll) return poll();
       throw Error('Unexpected page request');
     },
   });
-  return { get: (id: string) => elements.get(id), events, timers,
+  return { get: (id: string) => elements.get(id), events, timers, saved,
     async pollOnce() { const entry = timers.entries().next().value; assert.ok(entry); timers.delete(entry[0]); await entry[1](); } };
 }
+
+test('history synchronization starts off and saves independently of audio and interactions', async () => {
+  const f = await pageFixture(async () => response({ ok: false }));
+  await f.get('refresh').onclick();
+  assert.equal(f.get('historySyncEnabled').checked, false);
+  f.get('historySyncEnabled').checked = true;
+  await f.get('settings').onsubmit({ preventDefault() {} });
+  assert.equal(f.saved.length, 1);
+  assert.equal(f.saved[0].config.historySyncEnabled, true);
+  assert.equal(f.saved[0].config.audioEnabled, false);
+  assert.equal(Object.values(f.saved[0].config.interactions).every(value => value === false), true);
+  await f.get('refresh').onclick();
+  assert.equal(f.get('historySyncEnabled').checked, true);
+  f.get('historySyncEnabled').checked = false;
+  await f.get('settings').onsubmit({ preventDefault() {} });
+  assert.equal(f.saved[1].config.historySyncEnabled, false);
+});
 
 test('QR generation shows progress beside the button and displays the returned image', async () => {
   const pending = deferred<ReturnType<typeof response>>();

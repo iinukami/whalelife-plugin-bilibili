@@ -8,6 +8,7 @@ import { BiliError } from './errors.ts';
 export const actions: readonly Action[] = ['like', 'favorite', 'follow', 'comment', 'reply'];
 export const defaults: Config = {
   audioEnabled: false,
+  historySyncEnabled: false,
   interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
   favoriteFolderId: '', maxMediaBytes: 64 * 1024 * 1024, referenceTtlSeconds: 600,
 };
@@ -21,12 +22,16 @@ function bounded(value: unknown, minimum: number, maximum: number): number {
 }
 export function updateConfig(value: unknown, current: Config): Config {
   const input = record(value);
-  const allowed = new Set(['audioEnabled', 'interactions', 'favoriteFolderId', 'maxMediaBytes', 'referenceTtlSeconds']);
+  const allowed = new Set(['audioEnabled', 'historySyncEnabled', 'interactions', 'favoriteFolderId', 'maxMediaBytes', 'referenceTtlSeconds']);
   for (const key of Object.keys(input)) if (!allowed.has(key)) throw new BiliError('config_invalid');
   const next: Config = { ...current, interactions: { ...current.interactions } };
   if (Object.hasOwn(input, 'audioEnabled')) {
     if (typeof input.audioEnabled !== 'boolean') throw new BiliError('config_invalid');
     next.audioEnabled = input.audioEnabled;
+  }
+  if (Object.hasOwn(input, 'historySyncEnabled')) {
+    if (typeof input.historySyncEnabled !== 'boolean') throw new BiliError('config_invalid');
+    next.historySyncEnabled = input.historySyncEnabled;
   }
   if (Object.hasOwn(input, 'interactions')) {
     const switches = record(input.interactions);
