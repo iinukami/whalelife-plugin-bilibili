@@ -27,6 +27,85 @@ function fixture() {
 }
 async function open(f: ReturnType<typeof fixture>) { const result: any = await f.runtime.read('open', { target: video.bvid }, session); assert.equal(result.content.status, 'ok'); return result.content.data.videoRef; }
 
+test('message center requires login and validates source before IO; reading does not enable interactions', async t => {
+  const f = fixture(); t.after(() => f.runtime.dispose()); await f.runtime.initialize();
+  let reads = 0;
+  f.client.notifications = async (source, cursor, options) => {
+    reads++; assert.equal(options.cookie, 'SYNTHETIC_COOKIE'); assert.equal(cursor, undefined);
+    return { items: [{ id: '101', actors: [{ mid: 23, name: 'SYNTHETIC_NOTIFICATION_ACTOR' }], time: 1234,
+      type: 'reply', business: 'comment', title: 'SYNTHETIC_NOTIFICATION_TITLE', text: 'SYNTHETIC_NOTIFICATION_TEXT', originalText: 'SYNTHETIC_ORIGINAL_TEXT',
+      ...(source === 'likes' ? { likeCount: 3 } : {}) }], hasMore: false };
+  };
+  assert.equal((await f.runtime.read('notifications', { source: 'replies' }, session) as any).content.error.code, 'login_required');
+  f.login();
+  assert.equal((await f.runtime.read('notifications', { source: 'system' }, session) as any).content.error.code, 'invalid_input');
+  assert.equal((await f.runtime.read('notifications', { source: 'replies', cursor: { id: '101', time: 1234 } }, session) as any).content.error.code, 'invalid_input');
+  assert.equal(reads, 0);
+  for (const source of ['replies', 'likes']) {
+    const result: any = await f.runtime.read('notifications', { source }, session);
+    assert.equal(result.content.status, 'ok'); assert.equal(result.content.data.source, source);
+    assert.equal(result.content.data.untrusted, true); assert.equal(result.content.data.items[0].actors[0].mid, 23);
+    assert.ok(JSON.stringify(result.content).includes('SYNTHETIC_NOTIFICATION_TEXT'));
+    assert.ok(!JSON.stringify(result.receipt).includes('SYNTHETIC')); assert.ok(!JSON.stringify(result).includes('SYNTHETIC_COOKIE'));
+    assert.equal(result.content.data.cursor, undefined);
+  }
+  assert.equal(reads, 2); assert.equal(f.calls, 0); assert.deepEqual(f.config, defaults); assert.deepEqual(f.saved, {});
+});
+
+test('notification paging uses opaque references bound to source, session, account and expiry', async t => {
+  const f = fixture(); t.after(() => f.runtime.dispose()); f.login(); await f.runtime.initialize();
+  let reads = 0;
+  f.client.notifications = async (_source, cursor) => {
+    reads++;
+    if (cursor) { assert.deepEqual(cursor, { id: '101', time: 1234 }); return { items: [], hasMore: false }; }
+    return { items: [], hasMore: true, cursor: { id: '101', time: 1234 } };
+  };
+  const first: any = await f.runtime.read('notifications', { source: 'replies' }, session), cursor = first.content.data.cursor;
+  assert.match(cursor, /^bili_page_/); assert.ok(!JSON.stringify(first).includes('1234')); assert.ok(!JSON.stringify(first.receipt).includes(cursor));
+  for (const [args, caller] of [
+    [{ source: 'likes', cursor }, session],
+    [{ source: 'replies', cursor, sessionId: session.id }, { ...session, id: 'other' }],
+    [{ source: 'replies', cursor: '101' }, session],
+  ] as const) assert.equal((await f.runtime.read('notifications', args, caller) as any).content.error.code, 'reference_unavailable');
+  assert.equal(reads, 1);
+  const second: any = await f.runtime.read('notifications', { source: 'replies', cursor }, session);
+  assert.equal(second.content.status, 'ok'); assert.equal(second.content.data.hasMore, false); assert.equal(second.content.data.cursor, undefined);
+  f.changeAccount();
+  assert.equal((await f.runtime.read('notifications', { source: 'replies', cursor }, session) as any).content.error.code, 'reference_unavailable');
+  const fresh = (await f.runtime.read('notifications', { source: 'replies' }, session) as any).content.data.cursor;
+  f.advance();
+  assert.equal((await f.runtime.read('notifications', { source: 'replies', cursor: fresh }, session) as any).content.error.code, 'reference_unavailable');
+  assert.equal(reads, 3);
+});
+
+test('cancelled and account-changed notification results cannot disclose late external content', async t => {
+  for (const change of ['cancel', 'account'] as const) {
+    const f = fixture(); t.after(() => f.runtime.dispose()); f.login(); await f.runtime.initialize();
+    const caller = new AbortController();
+    f.client.notifications = async () => {
+      if (change === 'cancel') caller.abort(); else f.changeAccount();
+      return { items: [{ id: '101', actors: [], time: 1234, type: 'reply', business: 'comment', title: '', text: 'LATE_PRIVATE_NOTIFICATION', originalText: '' }], hasMore: true, cursor: { id: '101', time: 1234 } };
+    };
+    const result: any = await f.runtime.read('notifications', { source: 'replies' }, { ...session, signal: caller.signal });
+    assert.equal(result.content.error.code, change === 'cancel' ? 'cancelled' : 'account_changed');
+    assert.ok(!JSON.stringify(result).includes('LATE_PRIVATE_NOTIFICATION'));
+  }
+});
+
+test('notification cursors share the bounded reference budget and are cleared on dispose', async t => {
+  const f = fixture(); t.after(() => f.runtime.dispose()); f.login(); await f.runtime.initialize();
+  f.client.notifications = async () => ({ items: [], hasMore: true, cursor: { id: '101', time: 1234 } });
+  for (let i = 0; i < 127; i++) await open(f);
+  const first: any = await f.runtime.read('notifications', { source: 'likes' }, session);
+  assert.equal(first.content.status, 'ok');
+  assert.equal((await f.runtime.read('notifications', { source: 'likes' }, session) as any).content.error.code, 'busy');
+  assert.equal((await f.runtime.read('open', { target: video.bvid }, session) as any).content.error.code, 'busy');
+  f.advance();
+  assert.equal((await f.runtime.read('notifications', { source: 'likes' }, session) as any).content.status, 'ok');
+  await f.runtime.dispose();
+  assert.equal((await f.runtime.read('notifications', { source: 'likes', cursor: first.content.data.cursor }, session) as any).content.error.code, 'stopped');
+});
+
 test('references bind to trusted session, expiry and account generation; receipts omit external data', async () => {
   const f = fixture(); await f.runtime.initialize(); const ref = await open(f);
   const cross: any = await f.runtime.read('comments', { videoRef: ref, sessionId: session.id }, { ...session, id: 'other' });

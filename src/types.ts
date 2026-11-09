@@ -10,6 +10,14 @@ export interface VideoDetails extends VideoItem { cid: number; description: stri
 export interface VideoList { items: VideoItem[]; hasMore: boolean; cursor?: string; nextPage?: number }
 export interface CommentItem { rpid: string; root: string; text: string; author: { mid: number; name: string }; likes: number }
 export interface CommentList { items: CommentItem[]; hasMore: boolean; nextPage?: number }
+export type NotificationSource = 'replies' | 'likes';
+export interface NotificationCursor { id: string; time: number }
+export interface NotificationActor { mid: number; name: string }
+export interface NotificationItem {
+  id: string; actors: NotificationActor[]; time: number; type: string; business: string;
+  title: string; text: string; originalText: string; uri?: string; videoTarget?: string; likeCount?: number;
+}
+export interface NotificationList { items: NotificationItem[]; hasMore: boolean; cursor?: NotificationCursor }
 export interface SubtitleTrack { id: string; language: string; label: string; url: string }
 export interface SubtitleCue { from: number; to: number; text: string }
 export interface Media { bytes: Buffer; mime: string }
@@ -20,6 +28,7 @@ export interface BiliClientContract {
   search(query: string, page: number, options: CallOptions): Promise<VideoList>;
   video(target: string, options: CallOptions): Promise<VideoDetails>;
   comments(aid: number, page: number, options: CallOptions): Promise<CommentList>;
+  notifications(source: NotificationSource, cursor: NotificationCursor | undefined, options: CallOptions): Promise<NotificationList>;
   subtitles(bvid: string, cid: number, options: CallOptions): Promise<{ tracks: SubtitleTrack[]; loginRequired: boolean }>;
   subtitle(url: string, options: CallOptions): Promise<SubtitleCue[]>;
   media(bvid: string, cid: number, maxBytes: number, options: CallOptions): Promise<Media>;

@@ -1,7 +1,7 @@
 id: bilibili
 name: B 站
-version: 0.1.3
-description: 推荐、关注动态、搜索、视频字幕与可选视听，以及用户开启的账号互动。
+version: 0.1.4
+description: 推荐、关注动态、搜索、回复与点赞消息、视频字幕与可选视听，以及用户开启的账号互动。
 apiVersion: "1.0.0"
 depends: [surf]
 optionalDepends: [vision]

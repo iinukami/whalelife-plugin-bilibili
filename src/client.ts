@@ -7,7 +7,7 @@ import { validateLoginUrl } from './login-url.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
-  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput } from './types.ts';
+  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, NotificationSource, NotificationCursor, NotificationItem, NotificationList } from './types.ts';
 
 const API = 'https://api.bilibili.com';
 const PASSPORT = 'https://passport.bilibili.com';
@@ -52,6 +52,55 @@ function playableUrl(part: Record<string, any>): string {
     }
     throw primaryError;
   }
+}
+function notificationNumber(value: unknown, minimum = 0) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum) throw new BiliError('malformed_response');
+  return value;
+}
+function notificationText(value: unknown, max = 4000) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') throw new BiliError('malformed_response');
+  return plain(value, max);
+}
+function notificationItems(value: unknown): unknown[] {
+  if (value === null) return [];
+  if (!Array.isArray(value)) throw new BiliError('malformed_response');
+  if (value.length > 100) throw new BiliError('too_large');
+  return value;
+}
+function notificationLocation(value: unknown, type: string): { uri?: string; videoTarget?: string } {
+  if (value === undefined || value === null || value === '') return {};
+  if (typeof value !== 'string') throw new BiliError('malformed_response');
+  // Links are display data only. Drop tracking/fragment data and never infer an aid from a message or comment id.
+  try {
+    if (value.length > 4096 || /[\x00-\x20\x7f]/.test(value)) return {};
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port && url.port !== '443'
+      || !(url.hostname === 'bilibili.com' || url.hostname.endsWith('.bilibili.com') || url.hostname === 'b23.tv')) return {};
+    url.search = ''; url.hash = ''; safeUrl(url.href);
+    const match = ['www.bilibili.com', 'm.bilibili.com', 'bilibili.com'].includes(url.hostname)
+      && ['video', 'reply', 'danmu'].includes(type) ? /^\/video\/(BV[A-Za-z0-9]{10}|av[1-9]\d{0,15})\/?$/.exec(url.pathname) : null;
+    return match ? { uri: `https://www.bilibili.com/video/${match[1]}/`, videoTarget: match[1] } : { uri: url.href };
+  } catch { return {}; }
+}
+function notification(raw: unknown, source: NotificationSource): NotificationItem {
+  const value = record(raw), item = record(value.item);
+  if (typeof item.type !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(item.type)) throw new BiliError('malformed_response');
+  const people = source === 'replies' ? [record(value.user)] : notificationItems(value.users);
+  if (!people.length || people.length > 50) throw new BiliError('malformed_response');
+  const actors = people.map(raw => {
+    const person = record(raw), name = notificationText(person.nickname, 200);
+    if (!name) throw new BiliError('malformed_response');
+    return { mid: integer(person.mid), name };
+  });
+  if (source === 'replies' && typeof item.source_content !== 'string') throw new BiliError('malformed_response');
+  const title = notificationText(item.title) || notificationText(item.desc);
+  return { id: identifier(value.id), actors, time: notificationNumber(source === 'replies' ? value.reply_time : value.like_time),
+    type: item.type, business: notificationText(item.business, 100), title,
+    text: source === 'replies' ? notificationText(item.source_content) : title,
+    originalText: notificationText(item.target_reply_content) || notificationText(item.root_reply_content),
+    ...notificationLocation(item.uri, item.type),
+    ...(source === 'likes' ? { likeCount: notificationNumber(value.counts) } : {}) };
 }
 function checkedCookie(value: string | undefined) {
   if (!value) return '';
@@ -190,6 +239,34 @@ export class BiliClient implements BiliClientContract {
     const info = record(data.page); const total = Number(info.count); const size = Number(info.size ?? 20);
     const hasMore = Number.isFinite(total) && Number.isFinite(size) && size > 0 && page * size < total;
     return { items, hasMore, ...(hasMore ? { nextPage: page + 1 } : {}) };
+  }
+  async notifications(source: NotificationSource, cursor: NotificationCursor | undefined, options: CallOptions): Promise<NotificationList> {
+    if (source !== 'replies' && source !== 'likes') throw new BiliError('invalid_input');
+    if (cursor !== undefined && (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)
+      || Object.keys(cursor).some(key => key !== 'id' && key !== 'time')
+      || typeof cursor.id !== 'string' || !/^[1-9]\d{0,19}$/.test(cursor.id)
+      || typeof cursor.time !== 'number' || !Number.isSafeInteger(cursor.time) || cursor.time < 1)) throw new BiliError('invalid_input');
+    if (!checkedCookie(options.cookie)) throw new BiliError('login_required');
+    const data = apiData(await this.request(source === 'replies' ? '/x/msgfeed/reply' : '/x/msgfeed/like', {
+      platform: 'web', build: '0', mobi_app: 'web',
+      ...(cursor ? { id: cursor.id, [source === 'replies' ? 'reply_time' : 'like_time']: String(cursor.time) } : {}),
+    }, options));
+    try {
+      const history = source === 'replies' ? data : record(data.total), next = record(history.cursor);
+      if (typeof next.is_end !== 'boolean') throw new BiliError('malformed_response');
+      const nextId = identifier(next.id, true), nextTime = notificationNumber(next.time);
+      const hasMore = !next.is_end;
+      if (hasMore && (/^0+$/.test(nextId) || nextTime < 1 || cursor && nextId === cursor.id && nextTime === cursor.time)) throw new BiliError('malformed_response');
+      const latest = source === 'likes' && cursor === undefined && data.latest != null ? notificationItems(record(data.latest).items) : [];
+      const rows = [...latest, ...notificationItems(history.items)];
+      if (rows.length > 100) throw new BiliError('too_large');
+      const items: NotificationItem[] = [], ids = new Set<string>();
+      for (const row of rows) { const item = notification(row, source); if (!ids.has(item.id)) { ids.add(item.id); items.push(item); } }
+      return { items, hasMore, ...(hasMore ? { cursor: { id: nextId, time: nextTime } } : {}) };
+    } catch (error) {
+      if (error instanceof BiliError && error.code === 'too_large') throw error;
+      throw new BiliError('malformed_response');
+    }
   }
   async subtitles(id: string, cid: number, options: CallOptions): Promise<{ tracks: SubtitleTrack[]; loginRequired: boolean }> {
     bvid(id); integer(cid);

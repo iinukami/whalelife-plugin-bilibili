@@ -6,12 +6,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { CURRENT_HOST, MINIMUM_HOST, RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO,
+  RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, PRIVATE_NOTIFICATION_CURSOR,
   PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF, SYNTHETIC_COOKIE, VIDEO_ID, VIDEO_URL, hostFixture, installVision, until, diskText } from './host-fixture.ts';
 
 const deadline = { timeout: 40000 };
 const prefix = '/plugins/surf/bilibili';
 const callSpec = (name: string, args: unknown = {}) => ({ id: 'synthetic-' + name, name, arguments: JSON.stringify(args) });
-const readTools = ['bilibili_browse', 'bilibili_search', 'bilibili_open', 'bilibili_comments', 'bilibili_subtitles'];
+const readTools = ['bilibili_browse', 'bilibili_search', 'bilibili_open', 'bilibili_comments', 'bilibili_subtitles', 'bilibili_notifications'];
 
 for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
   test(`isolated host ${baseline}: dependency, settings authentication and explicit compatibility`, deadline, async t => {
@@ -87,6 +88,8 @@ test('four entry points, comments, subtitles and trusted references cross the is
 
 test('temporary platform content reaches only this model turn; ordinary final conversation survives', deadline, async t => {
   const f = await hostFixture(t);
+  const initial: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
   await f.plugin('conversation-fixture', `export function apply(ctx) {
     ctx.tools.register({name:'bilibili_fixture_echo',description:'Synthetic echo',danger:'safe',schema:{text:{type:'string'}},run:args=>args});
     ctx.provide('conversation-fixture',{run:input=>ctx.sessions.run(input),transient:input=>ctx.sessions.runTransient(input)});
@@ -96,10 +99,11 @@ test('temporary platform content reaches only this model turn; ordinary final co
   const visible = '已经找到视频。你还想继续看吗？SYNTHETIC_BILI_VISIBLE_REPLY';
   f.model(request => {
     round++;
-    if (round === 1) return { text: '', toolCalls: [callSpec('bilibili_open', { target: VIDEO_ID })] };
+    if (round === 1) return { text: '', toolCalls: [callSpec('bilibili_open', { target: VIDEO_ID }), callSpec('bilibili_notifications', { source: 'replies' })] };
     if (round === 2) {
       assert.ok(JSON.stringify(request.messages).includes(RAW_DESCRIPTION));
-      return { text: '', toolCalls: [callSpec('bilibili_fixture_echo', { text: RAW_DESCRIPTION })] };
+      assert.ok(JSON.stringify(request.messages).includes(RAW_NOTIFICATION_REPLY));
+      return { text: '', toolCalls: [callSpec('bilibili_fixture_echo', { text: RAW_DESCRIPTION + RAW_NOTIFICATION_REPLY })] };
     }
     return { text: visible, toolCalls: [] };
   });
@@ -109,7 +113,7 @@ test('temporary platform content reaches only this model turn; ordinary final co
   f.model(request => {
     const serialized = JSON.stringify(request.messages);
     assert.ok(serialized.includes(visible));
-    for (const marker of [RAW_TITLE, RAW_DESCRIPTION, PRIVATE_QUERY]) assert.ok(!serialized.includes(marker));
+    for (const marker of [RAW_TITLE, RAW_DESCRIPTION, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, PRIVATE_QUERY]) assert.ok(!serialized.includes(marker));
     return { text: '继续看你选的视频。', toolCalls: [] };
   });
   await f.service('conversation-fixture').run({ sessionId: f.sessionId, text: '继续', persona: 'a', permission: 'full' });
@@ -118,6 +122,62 @@ test('temporary platform content reaches only this model turn; ordinary final co
     : { text: RAW_TITLE, toolCalls: [] });
   assert.equal(await f.service('conversation-fixture').transient({ sessionId: f.sessionId, text: 'Synthetic technical read', persona: 'a', permission: 'full' }), RAW_TITLE);
   await f.assertPrivate();
+});
+
+test('notifications are demand-driven logged-in reads with private source-bound cursors and no interaction or model calls', deadline, async t => {
+  const f = await hostFixture(t);
+  const stats = () => f.service('bilibili-test-fixture').stats();
+  const notificationCalls = async () => (await stats()).calls.filter((name: string) => name.startsWith('notifications:')).length;
+  const tool = f.app.tools.entries.get('bilibili_notifications');
+  assert.equal(tool.danger, 'safe'); assert.equal(tool.transientResult, true);
+  assert.equal((await stats()).calls.length, 0, 'loading must not poll notifications');
+  for (const source of ['replies', 'likes']) {
+    assert.equal((await f.call('bilibili_notifications', { source })).result.error.code, 'login_required');
+  }
+  assert.equal(await notificationCalls(), 0, 'anonymous reads must fail before invoking the platform adapter');
+  const initial: any = await (await f.request(prefix + '/state')).json();
+  const imported = await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE });
+  assert.equal(imported.status, 200);
+  const account: any = (await imported.json()).account;
+  assert.equal(await notificationCalls(), 0, 'login must not start notification polling');
+  const status = await f.service().status();
+  assert.equal(Object.values(status.interactions).every(enabled => enabled === false), true);
+
+  const replies = await f.call('bilibili_notifications', { source: 'replies' });
+  assert.equal(replies.result.status, 'ok'); assert.equal(replies.result.data.untrusted, true);
+  assert.equal(replies.result.data.items[0].text, RAW_NOTIFICATION_REPLY);
+  assert.equal(Object.hasOwn(replies.result.data.items[0], 'commentRef'), false);
+  const replyCursor = replies.result.data.cursor;
+  assert.equal(typeof replyCursor, 'string'); assert.ok(replyCursor.length > 0);
+  assert.ok(!JSON.stringify(replies.result).includes(PRIVATE_NOTIFICATION_CURSOR));
+  const beforeInvalid = await notificationCalls();
+  const other = await f.app.sessions.create('Synthetic other notifications session');
+  assert.equal((await f.call('bilibili_notifications', { source: 'replies', cursor: replyCursor, sessionId: f.sessionId }, other)).result.error.code, 'reference_unavailable');
+  assert.equal((await f.call('bilibili_notifications', { source: 'likes', cursor: replyCursor })).result.error.code, 'reference_unavailable');
+  assert.equal(await notificationCalls(), beforeInvalid);
+  const next = await f.call('bilibili_notifications', { source: 'replies', cursor: replyCursor });
+  assert.equal(next.result.status, 'ok'); assert.equal(next.result.data.hasMore, false);
+  const likes = await f.call('bilibili_notifications', { source: 'likes' });
+  assert.equal(likes.result.status, 'ok'); assert.equal(likes.result.data.items[0].text, RAW_NOTIFICATION_LIKE);
+  assert.equal(likes.result.data.items[0].likeCount, 2);
+  const likeCursor = likes.result.data.cursor;
+  await f.service('bilibili-test-fixture').advance(86400000);
+  const beforeExpiry = await notificationCalls();
+  assert.equal((await f.call('bilibili_notifications', { source: 'likes', cursor: likeCursor })).result.error.code, 'reference_unavailable');
+  assert.equal(await notificationCalls(), beforeExpiry);
+
+  const fresh = await f.call('bilibili_notifications', { source: 'replies' });
+  const freshCursor = fresh.result.data.cursor;
+  assert.equal((await f.request(prefix + '/login/import', { revision: account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
+  const beforeAccountChange = await notificationCalls();
+  assert.equal((await f.call('bilibili_notifications', { source: 'replies', cursor: freshCursor })).result.error.code, 'reference_unavailable');
+  assert.equal(await notificationCalls(), beforeAccountChange);
+  const calls = (await stats()).calls;
+  assert.equal(calls.includes('interact'), false); assert.equal(calls.includes('beginLogin'), false);
+  assert.equal(f.requests.length, 0, 'notification reads must not invoke a model');
+  const pluginData = await diskText(join(f.bilibili, 'data'));
+  for (const marker of [RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, PRIVATE_NOTIFICATION_CURSOR, replyCursor, likeCursor, freshCursor]) assert.ok(!pluginData.includes(marker));
+  await f.assertPrivate([replyCursor, likeCursor, freshCursor]);
 });
 
 test('synthetic cookie import enables following, redacts credentials and invalidates references on identity changes', deadline, async t => {

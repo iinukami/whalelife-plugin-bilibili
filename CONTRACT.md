@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.1.3，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.1.4，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -10,6 +10,7 @@
 | bilibili_search | query、可选page；返回站内视频搜索结果 |
 | bilibili_open | target为普通视频URL/BV/av号/短链；返回资料、分P及videoRef |
 | bilibili_comments | videoRef、可选page；返回临时评论和commentRef |
+| bilibili_notifications | source=`replies|likes`，可选cursor；需登录，按需读取“回复我的”或“收到的赞”，下一页使用返回的同类cursor |
 | bilibili_subtitles | videoRef、part、language、offset；默认第一P、优先中文，返回最多60条时间轴字幕及nextOffset |
 | bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件及实际覆盖说明 |
 | bilibili_interact | action、operationId、videoRef或commentRef，以及评论/回复text；受独立开关、账号与full权限约束 |
@@ -17,6 +18,8 @@
 普通结果为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。不能用工具外层 `ok` 当作平台成功。互动结果明确 `confirmed|rejected|uncertain`，重复请求给 `duplicate:true`；pending重启记录视为uncertain，不发远端请求。稳定 operationId 及内容指纹共同防重发，记录中不保存评论正文或凭据。
 
 确认的互动通过 `memory.recordExperience` 记录固定动作说明；事件标识使用动作散列，重复补记幂等。记忆失败只影响 `experienceRecorded`，不把已经完成的外部动作重新提交。
+
+消息中心只读取列表，不后台轮询、主动提交已读或发送互动；互动开关关闭时仍可读取。通知的用户、正文、原内容与来源均仅作临时资料；聚合点赞只返回平台提供的用户列表，不承诺全部点赞者。普通视频来源的 `videoTarget` 可用于既有 open 工具，非视频来源不转换成视频或评论引用。通知不提供 `commentRef`，不扩展既有顶层评论读取为完整楼中楼。分页 cursor 为不透明内存引用，绑定可信会话、账号代际、来源及 TTL，与视频/评论引用共享容量上限；不接收模型拼装的平台原始分页字段。
 
 引用只在内存中保存，默认600秒，单会话最多128、全局512；过期、账号代际变化及重载失效。匿名状态也绑定登录状态代际，登录后再退出不会恢复此前的匿名引用。字幕、简介、评论、标题和声音证据标为外部资料，没有指令权威。持久回执只含动作和状态；浏览结果、原文、URL、引用与图片不进入回执。最终助手正文遵守主干现行保存契约。
 

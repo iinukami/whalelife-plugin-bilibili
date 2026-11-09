@@ -28,6 +28,18 @@ function fixture() {
   };
 }
 const errorCode = (code: string) => (error: unknown) => error instanceof BiliError && error.code === code;
+const notificationActor = { mid: 123, nickname: 'Synthetic actor', avatar: 'UNUSED_AVATAR', fans: 99, follow: true };
+function replyNotification(id: string | number = '101') {
+  return { id, user: { ...notificationActor }, reply_time: 1000, counts: 1, is_multi: 0,
+    item: { type: 'reply', business: '评论', business_id: 1, subject_id: 111, root_id: 333, source_id: 334, target_id: 333,
+      title: 'Synthetic video', desc: '', source_content: '<em>Synthetic reply</em> &amp; details', target_reply_content: 'Synthetic original comment',
+      root_reply_content: 'Synthetic root comment', uri: `https://www.bilibili.com/video/${BV}/?from=synthetic#reply334` } };
+}
+function likeNotification(id: string | number = '201') {
+  return { id, users: [{ ...notificationActor }, { ...notificationActor, mid: 124, nickname: 'Synthetic second actor' }], like_time: 1000, counts: 15,
+    item: { type: 'reply', business: '评论', business_id: 1, item_id: 444, pid: 111, title: 'Synthetic liked comment', desc: '',
+      uri: `https://www.bilibili.com/video/${BV}/?tracking=synthetic` } };
+}
 
 test('recommendation and search normalize ordinary videos without confusing ads or HTML titles', async () => {
   const f = fixture();
@@ -104,6 +116,109 @@ test('comment IDs retain exact decimal strings and server failures are not empty
   f.json({}, -352); await assert.rejects(f.client.comments(111, 1, {}), errorCode('access_blocked'));
   f.json({}, -101); await assert.rejects(f.client.comments(111, 1, {}), errorCode('login_required'));
   f.json({ result: 'changed' }); await assert.rejects(f.client.search('q', 1, {}), errorCode('malformed_response'));
+});
+
+test('notifications require login and validate typed cursors before any request', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  await assert.rejects(f.client.notifications('replies', undefined, {}), errorCode('login_required'));
+  await assert.rejects(f.client.notifications('messages' as any, undefined, { cookie: COOKIE }), errorCode('invalid_input'));
+  for (const cursor of [null, [], {}, { id: 1, time: 1000 }, { id: '0', time: 1000 }, { id: '01', time: 1000 }, { id: '1', time: '1000' },
+    { id: '1', time: 0 }, { id: '1', time: NaN }, { id: '1', time: Number.MAX_SAFE_INTEGER + 1 }, { id: '1', time: 1000, source: 'likes' },
+    { id: '1'.repeat(21), time: 1000 }, { id: '1&ack=1', time: 1000 }])
+    await assert.rejects(f.client.notifications('replies', cursor as any, { cookie: COOKIE }), errorCode('invalid_input'));
+  assert.equal(f.calls.length, 0);
+});
+
+test('reply notifications preserve exact ids and selected public fields without inventing reply targets', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  const row = replyNotification('9007199254740993123');
+  f.json({ cursor: { is_end: false, id: '9007199254740993124', time: 999 }, items: [row], last_view_at: 900 });
+  const found = await f.client.notifications('replies', undefined, { cookie: COOKIE });
+  assert.deepEqual(found.cursor, { id: '9007199254740993124', time: 999 }); assert.equal(found.hasMore, true);
+  assert.deepEqual(found.items, [{ id: '9007199254740993123', actors: [{ mid: 123, name: 'Synthetic actor' }], time: 1000,
+    type: 'reply', business: '评论', title: 'Synthetic video', text: 'Synthetic reply & details', originalText: 'Synthetic original comment',
+    uri: `https://www.bilibili.com/video/${BV}/`, videoTarget: BV }]);
+  assert.equal(Object.hasOwn(found.items[0], 'commentRef'), false);
+  const request = f.calls[0], url = new URL(request.url);
+  assert.equal(url.pathname, '/x/msgfeed/reply'); assert.equal(url.searchParams.get('platform'), 'web');
+  assert.equal(url.searchParams.get('build'), '0'); assert.equal(url.searchParams.get('mobi_app'), 'web');
+  assert.equal(url.searchParams.has('id'), false); assert.equal(request.options.method ?? 'GET', 'GET'); assert.equal(request.options.headers?.Cookie, COOKIE);
+  f.json({ cursor: { is_end: true, id: 0, time: 0 }, items: [] });
+  assert.deepEqual(await f.client.notifications('replies', found.cursor, { cookie: COOKIE }), { items: [], hasMore: false });
+  const next = new URL(f.calls[1].url); assert.equal(next.searchParams.get('id'), found.cursor!.id); assert.equal(next.searchParams.get('reply_time'), '999');
+  assert.equal(next.searchParams.has('like_time'), false); assert.equal(f.calls.length, 2);
+});
+
+test('like notifications merge latest and history once, deduplicate ids and paginate history only', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  f.json({ latest: { items: [likeNotification('201')], last_view_at: 900 },
+    total: { cursor: { is_end: false, id: 202, time: 998 }, items: [likeNotification('201'), likeNotification('202')] } });
+  const first = await f.client.notifications('likes', undefined, { cookie: COOKIE });
+  assert.deepEqual(first.items.map(item => item.id), ['201', '202']); assert.equal(first.items[0].actors.length, 2);
+  assert.equal(first.items[0].likeCount, 15); assert.equal(first.items[0].text, 'Synthetic liked comment'); assert.deepEqual(first.cursor, { id: '202', time: 998 });
+  f.json({ latest: { items: [likeNotification('201')] }, total: { cursor: { is_end: true, id: 0, time: 0 }, items: [likeNotification('203')] } });
+  const next = await f.client.notifications('likes', first.cursor, { cookie: COOKIE });
+  assert.deepEqual(next.items.map(item => item.id), ['203']); assert.equal(next.hasMore, false);
+  const url = new URL(f.calls[1].url); assert.equal(url.pathname, '/x/msgfeed/like'); assert.equal(url.searchParams.get('like_time'), '998');
+  assert.equal(url.searchParams.has('reply_time'), false);
+  assert.ok(f.calls.every(call => (call.options.method ?? 'GET') === 'GET' && ['/x/msgfeed/reply', '/x/msgfeed/like'].includes(new URL(call.url).pathname)));
+});
+
+test('non-video notification business remains display data and unsafe locations never become video targets', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  const rows = [
+    { ...replyNotification('1'), item: { ...replyNotification().item, type: 'article', business: '专栏', uri: `https://www.bilibili.com/video/${BV}/?token=synthetic` } },
+    { ...replyNotification('2'), item: { ...replyNotification().item, type: 'dynamic', business: '动态', uri: 'https://t.bilibili.com/123?tracking=synthetic#fragment' } },
+    ...['https://www.bilibili.com.evil.example/video/' + BV, 'https://synthetic:secret@www.bilibili.com/video/' + BV,
+      'javascript:alert(1)', 'http://www.bilibili.com/video/' + BV, 'https://127.0.0.1/video/' + BV,
+      'https://www.bilibili.com:444/video/' + BV].map((uri, i) => ({ ...replyNotification(String(i + 3)), item: { ...replyNotification().item, uri } })),
+    { ...replyNotification('9'), item: { ...replyNotification().item, uri: '', subject_id: 111, source_id: 222 } },
+  ];
+  f.json({ cursor: { is_end: true, id: 0, time: 0 }, items: rows });
+  const result = await f.client.notifications('replies', undefined, { cookie: COOKIE });
+  assert.equal(result.items.length, rows.length); assert.ok(result.items.every(item => !item.videoTarget));
+  assert.equal(result.items[1].uri, 'https://t.bilibili.com/123'); assert.ok(result.items.slice(2).every(item => item.uri === undefined));
+  assert.ok(!JSON.stringify(result).includes('synthetic:secret')); assert.ok(!JSON.stringify(result).includes('tracking='));
+});
+
+test('malformed notification rows and numeric fields fail explicitly instead of disappearing', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  for (const row of [null, { ...replyNotification(), item: null }, { ...replyNotification(), id: Number.MAX_SAFE_INTEGER + 1 },
+    { ...replyNotification(), user: {} }, { ...replyNotification(), reply_time: '1000' }, { ...replyNotification(), reply_time: -1 },
+    { ...replyNotification(), item: { ...replyNotification().item, source_content: 17 } },
+    { ...replyNotification(), item: { ...replyNotification().item, type: '<script>' } },
+    { ...replyNotification(), item: { ...replyNotification().item, uri: 123 } }]) {
+    f.json({ cursor: { is_end: true, id: 0, time: 0 }, items: [row] });
+    await assert.rejects(f.client.notifications('replies', undefined, { cookie: COOKIE }), errorCode('malformed_response'));
+  }
+  for (const row of [{ ...likeNotification(), users: [] }, { ...likeNotification(), users: 'changed' }, { ...likeNotification(), counts: -1 }, { ...likeNotification(), counts: '15' }]) {
+    f.json({ total: { cursor: { is_end: true, id: 0, time: 0 }, items: [row] } });
+    await assert.rejects(f.client.notifications('likes', undefined, { cookie: COOKIE }), errorCode('malformed_response'));
+  }
+});
+
+test('notification pagination rejects missing, malformed or stalled cursors while explicit empty endings succeed', async t => {
+  const f = fixture(); t.after(() => f.client.dispose()); const cursor = { id: '100', time: 1000 };
+  for (const next of [undefined, {}, { is_end: 1, id: 1, time: 1 }, { is_end: false, id: 0, time: 1 },
+    { is_end: false, id: 1, time: 0 }, { is_end: false, id: '100', time: 1000 }, { is_end: true, id: Number.MAX_SAFE_INTEGER + 1, time: 1 }]) {
+    f.json({ cursor: next, items: [] }); await assert.rejects(f.client.notifications('replies', cursor, { cookie: COOKIE }), errorCode('malformed_response'));
+  }
+  for (const data of [{}, { cursor: { is_end: true, id: 0, time: 0 } }, { cursor: { is_end: true, id: 0, time: 0 }, items: 'changed' }]) {
+    f.json(data); await assert.rejects(f.client.notifications('replies', undefined, { cookie: COOKIE }), errorCode('malformed_response'));
+  }
+  f.json({ cursor: { is_end: true, id: 0, time: 0 }, items: null });
+  assert.deepEqual(await f.client.notifications('replies', undefined, { cookie: COOKIE }), { items: [], hasMore: false });
+  f.json({ latest: null, total: { cursor: { is_end: true, id: 0, time: 0 }, items: [] } });
+  assert.deepEqual(await f.client.notifications('likes', undefined, { cookie: COOKIE }), { items: [], hasMore: false });
+});
+
+test('notification pages are bounded and platform login/restriction errors do not retry', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  f.json({ cursor: { is_end: true, id: 0, time: 0 }, items: Array.from({ length: 101 }, () => replyNotification()) });
+  await assert.rejects(f.client.notifications('replies', undefined, { cookie: COOKIE }), errorCode('too_large'));
+  f.json({}, -101); await assert.rejects(f.client.notifications('replies', undefined, { cookie: COOKIE }), errorCode('login_required'));
+  f.json({}, -352); await assert.rejects(f.client.notifications('likes', undefined, { cookie: COOKIE }), errorCode('access_blocked'));
+  assert.equal(f.calls.length, 3); assert.ok(f.calls.every(call => (call.options.method ?? 'GET') === 'GET'));
 });
 
 test('only official-discovered subtitles and images can be downloaded and never receive cookies', async () => {

@@ -19,6 +19,9 @@ export const RAW_DESCRIPTION = 'SYNTHETIC_BILI_FOREIGN_DESCRIPTION_DO_NOT_PERSIS
 export const RAW_COMMENT = 'SYNTHETIC_BILI_FOREIGN_COMMENT_DO_NOT_PERSIST';
 export const RAW_SUBTITLE = 'SYNTHETIC_BILI_FOREIGN_SUBTITLE_DO_NOT_PERSIST';
 export const RAW_AUDIO = 'SYNTHETIC_BILI_FOREIGN_AUDIO_DO_NOT_PERSIST';
+export const RAW_NOTIFICATION_REPLY = 'SYNTHETIC_BILI_NOTIFICATION_REPLY_DO_NOT_PERSIST';
+export const RAW_NOTIFICATION_LIKE = 'SYNTHETIC_BILI_NOTIFICATION_LIKE_DO_NOT_PERSIST';
+export const PRIVATE_NOTIFICATION_CURSOR = '90071992547409939';
 export const PRIVATE_QUERY = 'SYNTHETIC_BILI_PRIVATE_QUERY_DO_NOT_PERSIST';
 export const ERROR_SECRET = 'SYNTHETIC_BILI_ERROR_SECRET_DO_NOT_PERSIST';
 export const PRIVATE_MEDIA_REF = 'SYNTHETIC_BILI_PRIVATE_VISION_REFERENCE';
@@ -137,6 +140,18 @@ export async function apply(ctx) {
     async comments(aid, page, options) { record('comments', options); return { items: [
       { rpid:'90071992547409930', root:'0', text:${JSON.stringify(RAW_COMMENT)}, author:{mid:1122,name:'Synthetic reader'}, likes:2 }
     ], hasMore:false }; },
+    async notifications(source, cursor, options) {
+      record('notifications:' + source, options);
+      if (!options.cookie) throw new BiliError('login_required');
+      if (!['replies','likes'].includes(source)) throw new BiliError('invalid_input');
+      if (cursor && (cursor.id !== ${JSON.stringify(PRIVATE_NOTIFICATION_CURSOR)} || cursor.time !== 1234)) throw new BiliError('invalid_input');
+      return { items: [{id:cursor?'2002':'2001',actors:[{mid:1122,name:'Synthetic notification actor'}],time:1234,
+        type:'reply',business:'comment',title:${JSON.stringify(RAW_TITLE)},
+        text:source==='replies'?${JSON.stringify(RAW_NOTIFICATION_REPLY)}:${JSON.stringify(RAW_NOTIFICATION_LIKE)},
+        originalText:${JSON.stringify(RAW_COMMENT)},uri:${JSON.stringify(VIDEO_URL)},videoTarget:${JSON.stringify(VIDEO_ID)},
+        ...(source==='likes'?{likeCount:2}:{})}],hasMore:!cursor,
+        ...(!cursor?{cursor:{id:${JSON.stringify(PRIVATE_NOTIFICATION_CURSOR)},time:1234}}:{}) };
+    },
     async subtitles(bvid, cid, options) { record('subtitles', options); return { tracks:[{id:'1',language:'zh-CN',label:'Synthetic Chinese',url:'https://synthetic.bili.example/subtitle.json'}],loginRequired:false }; },
     async subtitle(url, options) { record('subtitle', options); return [{from:1,to:3,text:${JSON.stringify(RAW_SUBTITLE)}}]; },
     async media(bvid, cid, maxBytes, options) { record('media', options); return {bytes:Buffer.from('SYNTHETIC_MP4_NOT_A_REAL_VIDEO'),mime:'video/mp4'}; },
@@ -175,7 +190,8 @@ export async function apply(ctx) {
   const assertPrivate = async (extra: string[] = []) => {
     await app.runtime.events.drain();
     await app.memory.queue;
-    const markers = [RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF,
+    const markers = [RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE,
+      PRIVATE_NOTIFICATION_CURSOR, PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF,
       SYNTHETIC_COOKIE, 'SYNTHETIC_BILI_SESSION_SECRET', ...extra];
     for (const directory of ['memory', 'logs']) {
       const saved = await diskText(join(run, directory));

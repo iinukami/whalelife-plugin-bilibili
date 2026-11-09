@@ -5,9 +5,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { MultimodalToolOutput, OptionalService, ToolSession, TransientToolOutput } from 'whalelife';
 import { BiliError, object, safeError } from './errors.ts';
-import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, PreparedMedia, SurfService, VideoDetails, VideoItem, VisionService } from './types.ts';
+import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, PreparedMedia, SurfService, VideoDetails, VideoItem, VisionService } from './types.ts';
 
 type Ref = { session: string; account: string; expires: number; video: VideoItem | VideoDetails; comment?: CommentItem };
+type NotificationPageRef = { session: string; account: string; expires: number; source: NotificationSource; cursor: NotificationCursor };
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
 type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string };
 export interface RuntimeOptions {
@@ -21,6 +22,7 @@ const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(valu
 
 export class BiliRuntime {
   private refs = new Map<string, Ref>();
+  private notificationPages = new Map<string, NotificationPageRef>();
   private media = new Map<string, MediaRef>();
   private pendingMedia = new Map<string, Promise<MediaRef>>();
   private vision?: OptionalService<VisionService>;
@@ -55,6 +57,7 @@ export class BiliRuntime {
   private guard() { if (this.options.signal.aborted || this.controller.signal.aborted) throw new BiliError('stopped'); if (!this.options.transient) throw new BiliError('host_required'); }
   private sweep() {
     for (const [id, ref] of this.refs) if (ref.expires <= this.now() || ref.account !== this.identity()) this.refs.delete(id);
+    for (const [id, ref] of this.notificationPages) if (ref.expires <= this.now() || ref.account !== this.identity()) this.notificationPages.delete(id);
     for (const [id, ref] of this.media) if (ref.expires <= this.now() || ref.binding.signal.aborted || ref.account !== this.identity()) { this.media.delete(id); void this.release(ref); }
   }
   private async release(ref: MediaRef) {
@@ -87,12 +90,28 @@ export class BiliRuntime {
     }
     const result = await withSignal(pending, options.signal); check(); return result;
   }
-  private put(session: string, account: string, video: VideoItem | VideoDetails, comment?: CommentItem) {
+  private reserveReference(session: string, account: string) {
     this.sweep();
-    if (this.refs.size >= 512 || [...this.refs.values()].filter(r => r.session === session).length >= 128) throw new BiliError('busy');
-    const id = 'bili_' + randomUUID();
+    const all = [...this.refs.values(), ...this.notificationPages.values()];
+    if (all.length >= 512 || all.filter(r => r.session === session).length >= 128) throw new BiliError('busy');
     if (account !== this.identity()) throw new BiliError('account_changed');
+  }
+  private put(session: string, account: string, video: VideoItem | VideoDetails, comment?: CommentItem) {
+    this.reserveReference(session, account);
+    const id = 'bili_' + randomUUID();
     this.refs.set(id, { session, account, expires: this.now() + this.options.config().referenceTtlSeconds * 1000, video, ...(comment ? { comment } : {}) }); return id;
+  }
+  private putNotificationPage(session: string, account: string, source: NotificationSource, cursor: NotificationCursor) {
+    this.reserveReference(session, account);
+    const id = 'bili_page_' + randomUUID();
+    this.notificationPages.set(id, { session, account, source, cursor: { ...cursor }, expires: this.now() + this.options.config().referenceTtlSeconds * 1000 });
+    return id;
+  }
+  private notificationPage(id: unknown, session: string, source: NotificationSource) {
+    this.sweep();
+    const ref = this.notificationPages.get(string(id));
+    if (!ref || ref.session !== session || ref.account !== this.identity() || ref.source !== source) throw new BiliError('reference_unavailable');
+    return { ...ref.cursor };
   }
   private get(id: unknown, session: string) {
     this.sweep(); const ref = this.refs.get(typeof id === 'string' ? id : '');
@@ -118,6 +137,16 @@ export class BiliRuntime {
     try {
       const args = object(raw);
       const data = await this.operation(session, async (id, options, identity) => {
+        if (action === 'notifications') {
+          if (args.source !== 'replies' && args.source !== 'likes') throw new BiliError('invalid_input');
+          if (!options.cookie) throw new BiliError('login_required');
+          const source = args.source;
+          const cursor = args.cursor === undefined ? undefined : this.notificationPage(args.cursor, id, source);
+          const result = await this.client.notifications(source, cursor, options);
+          if (options.signal?.aborted) throw new BiliError('cancelled');
+          return { source, items: result.items, hasMore: result.hasMore,
+            ...(result.hasMore && result.cursor ? { cursor: this.putNotificationPage(id, identity, source, result.cursor) } : {}), untrusted: true };
+        }
         if (action === 'browse' || action === 'search') {
           const page = integer(args.page, 1);
           let result;
@@ -253,7 +282,7 @@ export class BiliRuntime {
     }
   }
   async dispose() {
-    this.controller.abort(); this.refs.clear();
+    this.controller.abort(); this.refs.clear(); this.notificationPages.clear();
     const offers = [...this.media.values()]; this.media.clear();
     this.pendingMedia.clear(); await Promise.allSettled(offers.map(x => this.release(x)));
     await this.client.dispose();
