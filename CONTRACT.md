@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.1.1，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.1.2，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -23,5 +23,7 @@
 `bilibili_watch` 消费 vision 的公开 `offerMedia/prepare/understand/release`，仅内部保留媒体引用。声音关闭仅调 `prepare`；开启要求 audiovisualApiVersion 1.0.0 与 understand 存在，显式 `audio:['speech']`。不另选主模型、不将base64当普通JSON交给模型、不代为收藏或发送。采样与语音后端失败准确呈现，部分成功不冒充全片理解。
 
 设置路径均位于 `/plugins/surf/bilibili/`，继承宿主鉴权与来源检查。GET settings/config/state/folders，POST config/login/start/login/poll/login/import/login/logout。配置与账号修改采用各自 revision，拒绝过期编辑；二维码只由本地编码器生成，登录密钥不返回状态。Cookie不随重定向传播到CDN。网络请求仅HTTPS、公网DNS校验并固定连接地址，压缩前后限量、限时、可取消，无自动业务重试。
+
+MP4 下载前先校验主地址；若不通过，只检查同一播放响应中前8个备用地址，选择首个通过相同校验的候选。所有候选仍受标准 HTTPS 端口、公网 DNS 和下载限额约束；开始下载后失败不会自动换地址重试，CDN 请求不附带账号 Cookie。
 
 平台HTTP/JSON数据结构仅在本插件内适配，版本变化以明确错误报告。缺少宿主临时工具时停用浏览，缺少视觉只关闭观看。插件停止撤销入口并取消所属请求；已经确认的远端动作不伪装撤销、不自动重放。

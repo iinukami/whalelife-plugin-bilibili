@@ -143,6 +143,36 @@ test('complete MP4 retrieval accepts provider CDN origins without cookies and re
   assert.equal(f.calls.length, 9);
 });
 
+test('MP4 selects a safe provider backup before downloading when the primary URL is rejected', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  const primary = 'https://synthetic.edge.mountaintoys.cn:4483/media.mp4';
+  const backup = 'https://synthetic.bilivideo.com/media.mp4';
+  const bytes = Buffer.from([0,0,0,16,102,116,121,112,105,115,111,109,0,0,0,0]);
+  f.json({ format: 'mp4', durl: [{ size: 16, url: primary, backup_url: [null, 'https://127.0.0.1/media.mp4', backup] }] });
+  f.queue.push({ body: bytes });
+  assert.deepEqual((await f.client.media(BV, 10, 1024, { cookie: COOKIE })).bytes, bytes);
+  assert.equal(f.calls.length, 2); assert.equal(f.calls[1].url, backup);
+  assert.equal(f.calls[1].options.headers?.Cookie, undefined);
+  f.json({ format: 'mp4', durl: [{ url: primary, backup_url: ['https://localhost/media.mp4', 'https://synthetic:secret@synthetic.bilivideo.com/media.mp4'] }] });
+  await assert.rejects(f.client.media(BV, 10, 1024, {}), errorCode('unsafe_url'));
+  f.json({ format: 'mp4', durl: [{ url: primary, backup_url: backup }] });
+  await assert.rejects(f.client.media(BV, 10, 1024, {}), errorCode('unsafe_url'));
+  f.json({ format: 'mp4', durl: [{ url: primary, backup_url: [...Array(8).fill(null), backup] }] });
+  await assert.rejects(f.client.media(BV, 10, 1024, {}), errorCode('unsafe_url'));
+  assert.equal(f.calls.length, 5);
+});
+
+test('MP4 prefers a valid primary and never tries backups after a download failure', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  const primary = 'https://synthetic-primary.bilivideo.com/media.mp4';
+  const backup = 'https://synthetic-backup.bilivideo.com/media.mp4';
+  f.json({ format: 'mp4', durl: [{ url: primary, backup_url: [backup] }] });
+  f.queue.push({ status: 403 });
+  await assert.rejects(f.client.media(BV, 10, 1024, { cookie: COOKIE }), errorCode('access_blocked'));
+  assert.equal(f.calls.length, 2); assert.equal(f.calls[1].url, primary);
+  assert.equal(f.calls[1].options.headers?.Cookie, undefined);
+});
+
 test('QR login states only return minimal selected cookies after a locally issued key confirms', async () => {
   const f = fixture(); const key = 'synthetic_qr_key_0123456789';
   assert.deepEqual(await f.client.pollLogin('unissued', {}), { state: 'expired' }); assert.equal(f.calls.length, 0);

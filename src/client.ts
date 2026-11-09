@@ -44,6 +44,15 @@ function mediaUrl(value: unknown) {
   if (typeof value !== 'string') throw new BiliError('malformed_response');
   return safeUrl(value.startsWith('//') ? `https:${value}` : value.startsWith('http://') ? `https://${value.slice(7)}` : value).href;
 }
+function playableUrl(part: Record<string, any>): string {
+  try { return mediaUrl(part.url); } catch (primaryError) {
+    // Select a provider-supplied candidate before downloading; never retry a failed request.
+    for (const candidate of Array.isArray(part.backup_url) ? part.backup_url.slice(0, 8) : []) {
+      try { return mediaUrl(candidate); } catch { /* Keep the same URL safety rules for backups. */ }
+    }
+    throw primaryError;
+  }
+}
 function checkedCookie(value: string | undefined) {
   if (!value) return '';
   if (typeof value !== 'string' || value.length > 16384 || /[\x00-\x1f\x7f]/.test(value)) throw new BiliError('invalid_input');
@@ -225,7 +234,7 @@ export class BiliClient implements BiliClientContract {
     if (!Array.isArray(data.durl) || data.durl.length !== 1 || typeof data.format !== 'string' || !data.format.includes('mp4')) throw new BiliError('unsupported_media');
     const part = record(data.durl[0]);
     if (typeof part.size === 'number' && part.size > maxBytes) throw new BiliError('too_large');
-    const bytes = await this.download(mediaUrl(part.url), maxBytes, options);
+    const bytes = await this.download(playableUrl(part), maxBytes, options);
     if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp'
       || Number.isSafeInteger(part.size) && part.size > 0 && bytes.length !== part.size) throw new BiliError('unsupported_media');
     return { bytes, mime: 'video/mp4' };
