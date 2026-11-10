@@ -5,14 +5,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { CURRENT_HOST, MINIMUM_HOST, RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO,
+import { CURRENT_HOST, MINIMUM_HOST, RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_DANMAKU,
   RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY, PRIVATE_NOTIFICATION_CURSOR,
   PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF, SYNTHETIC_COOKIE, VIDEO_ID, VIDEO_URL, hostFixture, installVision, until, diskText } from './host-fixture.ts';
 
 const deadline = { timeout: 40000 };
 const prefix = '/plugins/surf/bilibili';
 const callSpec = (name: string, args: unknown = {}) => ({ id: 'synthetic-' + name, name, arguments: JSON.stringify(args) });
-const readTools = ['bilibili_browse', 'bilibili_search', 'bilibili_open', 'bilibili_comments', 'bilibili_subtitles', 'bilibili_notifications', 'bilibili_replies'];
+const readTools = ['bilibili_browse', 'bilibili_search', 'bilibili_open', 'bilibili_comments', 'bilibili_subtitles', 'bilibili_notifications', 'bilibili_replies', 'bilibili_danmaku'];
 
 for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
   test(`isolated host ${baseline}: dependency, settings authentication and explicit compatibility`, deadline, async t => {
@@ -28,6 +28,8 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
     assert.equal(status.ready, current);
     assert.equal(status.audioEnabled, false);
     assert.equal(status.historySyncEnabled, false);
+    assert.equal(status.danmakuEnabled, false);
+    assert.equal(status.autoRefreshEnabled, false);
     for (const enabled of Object.values(status.interactions)) assert.equal(enabled, false);
     for (const path of ['/config', '/state', '/settings']) {
       assert.equal((await fetch(f.baseUrl + prefix + path, { signal: AbortSignal.timeout(4000) })).status, 401);
@@ -56,6 +58,36 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
     await f.assertPrivate();
   });
 }
+
+test('optional danmaku, coin and renewal cross the host boundary with independent switches and private credentials', deadline, async t => {
+  const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
+  const state: any = await (await f.request(prefix + '/state')).json();
+  assert.equal((await f.request(prefix + '/login/import', { revision: state.account.revision, cookie: SYNTHETIC_COOKIE, refreshToken: 'SYNTHETIC_REFRESH_OLD' })).status, 200);
+  const videoRef = (await f.call('bilibili_open', { target: VIDEO_ID })).result.data.videoRef;
+  assert.equal((await f.call('bilibili_danmaku', { videoRef })).result.error.code, 'danmaku_disabled');
+  const args = { action: 'coin', videoRef, coinCount: 2, operationId: 'synthetic-coin' };
+  assert.equal((await f.call('bilibili_interact', args)).result.error.code, 'interaction_disabled');
+  const settings: any = await (await f.request(prefix + '/config')).json();
+  assert.equal((await f.request(prefix + '/config', { revision: settings.revision, config: { ...settings.config,
+    danmakuEnabled: true, autoRefreshEnabled: true, interactions: { ...settings.config.interactions, coin: true } } })).status, 200);
+  let publicState: any = await (await f.request(prefix + '/state')).json();
+  assert.equal(publicState.renewal.available, true); assert.equal((await fixture.stats()).calls.some((c: string) => c.startsWith('refresh:')), false, 'settings/status must not renew');
+  const danmaku = await f.call('bilibili_danmaku', { videoRef });
+  assert.equal(danmaku.result.data.items[0].text, RAW_DANMAKU); assert.equal(danmaku.result.data.untrusted, true);
+  publicState = await (await f.request(prefix + '/state')).json(); assert.equal(publicState.renewal.status, 'refreshed');
+  assert.equal((await f.app.tools.call('bilibili_interact', args, { id: f.sessionId, permission: 'ask' })).ok, false);
+  assert.equal((await fixture.stats()).submissions.length, 0);
+  const coin = await f.call('bilibili_interact', args); assert.equal(coin.result.data.spentCoins, 2);
+  assert.equal((await f.call('bilibili_interact', args)).result.data.duplicate, true);
+  for (let i = 0; i < 2; i++) assert.equal((await f.call('bilibili_interact', { ...args, operationId: 'synthetic-coin-alias' })).result.data.duplicate, true);
+  const stats = await fixture.stats(); assert.equal(stats.submissions.length, 1); assert.equal(stats.submissions[0].coinCount, 2);
+  assert.equal(stats.calls.filter((c: string) => c === 'refresh:renew').length, 1); assert.equal(f.requests.length, 0);
+  const experiences = (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((r: any) => r.origin?.action === 'coin');
+  assert.equal(experiences.length, 1);
+  for (const marker of ['SYNTHETIC_REFRESH_OLD', 'SYNTHETIC_REFRESH_NEXT', 'SYNTHETIC_ROTATED_SESSION']) assert.equal(JSON.stringify(publicState).includes(marker), false);
+  const pluginData = await diskText(join(f.bilibili, 'data')); assert.equal(pluginData.includes(RAW_DANMAKU), false);
+  await f.assertPrivate([videoRef, 'SYNTHETIC_REFRESH_OLD', 'SYNTHETIC_REFRESH_NEXT', 'SYNTHETIC_ROTATED_SESSION']);
+});
 
 test('four entry points, comments, subtitles and trusted references cross the isolated process boundary', deadline, async t => {
   const f = await hostFixture(t);

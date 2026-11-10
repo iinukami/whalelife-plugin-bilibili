@@ -14,6 +14,9 @@ const messages: Record<string, string> = {
   subtitle_unavailable: '没有可用字幕；声音处理关闭时不会自动转写。', persistence_error: '本地状态保存失败，未继续发起新动作。',
   comment_mismatch: '评论目标与视频或通知不一致，未继续操作。',
   history_disabled: '尚未开启同步 B 站观看历史。',
+  danmaku_disabled: '尚未开启读取 B 站弹幕。',
+  coin_limit: '投币数量超过该视频允许的累计上限。', coin_balance: '账号硬币余额不足，未提交投币。',
+  coin_self: '不能给当前账号自己的视频投币。',
 };
 export class BiliError extends Error { code: string; constructor(code: string) { super(messages[code] ?? messages.platform_error); this.name = 'BiliError'; this.code = messages[code] ? code : 'platform_error'; } }
 export function safeError(error: unknown) { const e = error instanceof BiliError ? error : new BiliError('network_error'); return { code: e.code, message: e.message }; }

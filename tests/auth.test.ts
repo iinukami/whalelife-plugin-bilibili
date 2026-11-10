@@ -95,6 +95,9 @@ test('AuthManager rejects unapproved QR destinations even when a client adapter 
 
 test('configuration defaults keep audio and every interaction disabled; partial updates preserve independent settings', () => {
   const config = parseConfig({});
+  assert.equal(config.danmakuEnabled, false); assert.equal(config.autoRefreshEnabled, false); assert.equal(config.interactions.coin, false);
+  const optional = updateConfig({ danmakuEnabled: true, interactions: { coin: true } }, config);
+  assert.equal(optional.danmakuEnabled, true); assert.equal(optional.interactions.coin, true); assert.equal(optional.autoRefreshEnabled, false); assert.equal(optional.audioEnabled, false);
   assert.equal(config.audioEnabled, false);
   assert.ok(Object.values(config.interactions).every(value => value === false));
   const changed = updateConfig({ interactions: { comment: true }, favoriteFolderId: '301' }, config);
@@ -103,7 +106,7 @@ test('configuration defaults keep audio and every interaction disabled; partial 
   assert.equal(config.interactions.comment, false);
   assert.equal(defaults.interactions.comment, false);
   assert.equal(changed.favoriteFolderId, '301');
-  for (const input of [{ audioEnabled: 'false' }, { interactions: { coin: true } }, { interactions: { like: 1 } },
+  for (const input of [{ audioEnabled: 'false' }, { interactions: { share: true } }, { interactions: { like: 1 } },
     { maxMediaBytes: 65 * 1048576 }, { referenceTtlSeconds: 0 }, { favoriteFolderId: '../data' }, { cookie: COOKIE }, [], null]) {
     assert.throws(() => parseConfig(input), errorCode('config_invalid'));
   }

@@ -66,7 +66,9 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
         }
         let url = safeUrl(input);
         if (headers.cookie && !COOKIE_HOSTS.has(url.hostname)) throw new BiliError('unsafe_url');
-        if (method === 'POST' && url.hostname !== 'api.bilibili.com') throw new BiliError('unsafe_url');
+        const refreshPost = url.hostname === 'passport.bilibili.com' && !url.search
+          && ['/x/passport-login/web/cookie/refresh', '/x/passport-login/web/confirm/refresh'].includes(url.pathname);
+        if (method === 'POST' && url.hostname !== 'api.bilibili.com' && !refreshPost) throw new BiliError('unsafe_url');
         if (signal.aborted) throw abortError();
         timer = setTimeout(() => deadline.abort(), options.timeoutMs); timer.unref();
         for (let redirects = 0; ; redirects++) {

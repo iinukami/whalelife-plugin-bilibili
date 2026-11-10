@@ -5,11 +5,12 @@
 import type { Action, Config } from './types.ts';
 import { BiliError } from './errors.ts';
 
-export const actions: readonly Action[] = ['like', 'favorite', 'follow', 'comment', 'reply'];
+export const actions: readonly Action[] = ['like', 'favorite', 'follow', 'comment', 'reply', 'coin'];
 export const defaults: Config = {
   audioEnabled: false,
   historySyncEnabled: false,
-  interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
+  danmakuEnabled: false, autoRefreshEnabled: false,
+  interactions: { like: false, favorite: false, follow: false, comment: false, reply: false, coin: false },
   favoriteFolderId: '', maxMediaBytes: 64 * 1024 * 1024, referenceTtlSeconds: 600,
 };
 function record(value: unknown): Record<string, unknown> {
@@ -22,9 +23,12 @@ function bounded(value: unknown, minimum: number, maximum: number): number {
 }
 export function updateConfig(value: unknown, current: Config): Config {
   const input = record(value);
-  const allowed = new Set(['audioEnabled', 'historySyncEnabled', 'interactions', 'favoriteFolderId', 'maxMediaBytes', 'referenceTtlSeconds']);
+  const allowed = new Set(['audioEnabled', 'historySyncEnabled', 'danmakuEnabled', 'autoRefreshEnabled', 'interactions', 'favoriteFolderId', 'maxMediaBytes', 'referenceTtlSeconds']);
   for (const key of Object.keys(input)) if (!allowed.has(key)) throw new BiliError('config_invalid');
   const next: Config = { ...current, interactions: { ...current.interactions } };
+  for (const key of ['danmakuEnabled', 'autoRefreshEnabled'] as const) if (Object.hasOwn(input, key)) {
+    if (typeof input[key] !== 'boolean') throw new BiliError('config_invalid'); next[key] = input[key];
+  }
   if (Object.hasOwn(input, 'audioEnabled')) {
     if (typeof input.audioEnabled !== 'boolean') throw new BiliError('config_invalid');
     next.audioEnabled = input.audioEnabled;

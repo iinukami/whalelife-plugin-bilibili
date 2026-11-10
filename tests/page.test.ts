@@ -68,6 +68,19 @@ test('history synchronization starts off and saves independently of audio and in
   assert.equal(f.saved[1].config.historySyncEnabled, false);
 });
 
+test('danmaku, coin and automatic renewal are three independent default-off controls', async () => {
+  const f = await pageFixture(async () => response({ ok: false })); await f.get('refresh').onclick();
+  for (const id of ['danmakuEnabled', 'autoRefreshEnabled', 'coin']) assert.equal(f.get(id).checked, false);
+  for (const id of ['danmakuEnabled', 'autoRefreshEnabled', 'coin']) {
+    f.get(id).checked = true; await f.get('settings').onsubmit({ preventDefault() {} });
+    const config = f.saved.at(-1).config;
+    assert.equal(config.danmakuEnabled, id === 'danmakuEnabled'); assert.equal(config.autoRefreshEnabled, id === 'autoRefreshEnabled');
+    assert.equal(config.interactions.coin, id === 'coin'); assert.equal(config.audioEnabled, false); assert.equal(config.historySyncEnabled, false);
+    for (const action of ['like', 'favorite', 'follow', 'comment', 'reply']) assert.equal(config.interactions[action], false);
+    f.get(id).checked = false; await f.get('settings').onsubmit({ preventDefault() {} });
+  }
+});
+
 test('QR generation shows progress beside the button and displays the returned image', async () => {
   const pending = deferred<ReturnType<typeof response>>();
   const f = await pageFixture(() => pending.promise);

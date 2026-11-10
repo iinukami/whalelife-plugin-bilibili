@@ -19,6 +19,7 @@ export const RAW_DESCRIPTION = 'SYNTHETIC_BILI_FOREIGN_DESCRIPTION_DO_NOT_PERSIS
 export const RAW_COMMENT = 'SYNTHETIC_BILI_FOREIGN_COMMENT_DO_NOT_PERSIST';
 export const RAW_SUBTITLE = 'SYNTHETIC_BILI_FOREIGN_SUBTITLE_DO_NOT_PERSIST';
 export const RAW_AUDIO = 'SYNTHETIC_BILI_FOREIGN_AUDIO_DO_NOT_PERSIST';
+export const RAW_DANMAKU = 'SYNTHETIC_BILI_DANMAKU_DO_NOT_PERSIST';
 export const RAW_NOTIFICATION_REPLY = 'SYNTHETIC_BILI_NOTIFICATION_REPLY_DO_NOT_PERSIST';
 export const RAW_NOTIFICATION_LIKE = 'SYNTHETIC_BILI_NOTIFICATION_LIKE_DO_NOT_PERSIST';
 export const RAW_THREAD_ROOT = 'SYNTHETIC_BILI_THREAD_ROOT_DO_NOT_PERSIST';
@@ -117,7 +118,7 @@ import { BiliError } from ${JSON.stringify(pathToFileURL(join(root, 'src/errors.
 export async function apply(ctx) {
   let now = Date.now(), calls = [], waiting = false, cancelled = 0, disposed = false, scenario = 'normal', resume;
   const submissions = [], historyPosts = []; let historyProgress = {found:false};
-  const video = { bvid: ${JSON.stringify(VIDEO_ID)}, aid: 12345, cid: 67890,
+  const video = { bvid: ${JSON.stringify(VIDEO_ID)}, aid: 12345, cid: 67890, copyright: 1,
     title: ${JSON.stringify(RAW_TITLE)}, description: ${JSON.stringify(RAW_DESCRIPTION)},
     owner: { mid: 9988, name: 'Synthetic creator' }, duration: 120,
     cover: 'https://synthetic.bili.example/cover.jpg', url: ${JSON.stringify(VIDEO_URL)},
@@ -198,12 +199,18 @@ export async function apply(ctx) {
     async subtitle(url, options) { record('subtitle', options); return [{from:1,to:3,text:${JSON.stringify(RAW_SUBTITLE)}}]; },
     async media(bvid, cid, maxBytes, options) { record('media', options); return {bytes:Buffer.from('SYNTHETIC_MP4_NOT_A_REAL_VIDEO'),mime:'video/mp4'}; },
     async image(url, maxBytes, options) { record('image', options); throw Error('Image is not part of this fixture'); },
-    async account(options) { record('account', options); if (!options.cookie) throw new BiliError('login_required'); return {mid:4321,name:'Synthetic account'}; },
+    async account(options) { record('account', options); if (!options.cookie) throw new BiliError('login_required'); return {mid:4321,name:'Synthetic account',coins:5}; },
+    async danmaku(input, options) { record('danmaku', options); return {items:[{id:'1234',atSeconds:1,mode:1,text:${JSON.stringify(RAW_DANMAKU)}}],segments:[1],excludedModes:0,truncated:false}; },
+    async coins(aid, options) { record('coins', options); return 0; },
+    async checkRefresh(options) { record('refresh:check', options); return {refresh:true,timestamp:1234}; },
+    async refreshCsrf(timestamp, options) { record('refresh:csrf', options); return 'SYNTHETIC_REFRESH_CSRF'; },
+    async renewCookies(token, csrf, options) { record('refresh:renew', options); return {cookie:${JSON.stringify(SYNTHETIC_COOKIE)}.replace('SYNTHETIC_BILI_SESSION_SECRET','SYNTHETIC_ROTATED_SESSION'),refreshToken:'SYNTHETIC_REFRESH_NEXT'}; },
+    async confirmRefresh(token, options) { record('refresh:confirm', options); },
     async beginLogin(options) { record('beginLogin', options); return {url:'https://passport.bilibili.com/synthetic-login',key:'synthetic-qr-key'}; },
     async pollLogin(key, options) { record('pollLogin', options); return {state:'waiting'}; },
     async folders(mid, options) { record('folders', options); return [{id:'7',title:'Synthetic folder'}]; },
     async interact(input, options) { record('interact', options);
-      submissions.push({action:input.action,aid:input.aid,mid:input.mid,root:input.root,parent:input.parent});
+      submissions.push({action:input.action,aid:input.aid,mid:input.mid,root:input.root,parent:input.parent,...(input.action==='coin'?{coinCount:input.coinCount}:{})});
       return {state:'confirmed',platformId:'123456789'}; },
     dispose() { disposed = true; }
   };
@@ -235,7 +242,7 @@ export async function apply(ctx) {
   const assertPrivate = async (extra: string[] = []) => {
     await app.runtime.events.drain();
     await app.memory.queue;
-    const markers = [RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY,
+    const markers = [RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_DANMAKU, RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY,
       PRIVATE_NOTIFICATION_CURSOR, PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF,
       SYNTHETIC_COOKIE, 'SYNTHETIC_BILI_SESSION_SECRET', ...extra];
     for (const directory of ['memory', 'logs']) {

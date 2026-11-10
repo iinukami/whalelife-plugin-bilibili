@@ -27,6 +27,77 @@ function fixture() {
 }
 async function open(f: ReturnType<typeof fixture>) { const result: any = await f.runtime.read('open', { target: video.bvid }, session); assert.equal(result.content.status, 'ok'); return result.content.data.videoRef; }
 
+test('danmaku is off without IO, bounded, paginated, transient and rechecked after disabling', async t => {
+  const f = fixture(); t.after(() => f.runtime.dispose()); await f.runtime.initialize(); let reads = 0;
+  f.client.danmaku = async () => { reads++; return { items: Array.from({ length: 101 }, (_, i) => ({ id: String(i + 1), atSeconds: 1, mode: 1, text: 'SYNTHETIC_DANMAKU_TEXT' })), truncated: false, excludedModes: 0, segments: [1] }; };
+  assert.equal((await f.runtime.read('danmaku', {}, session) as any).content.error.code, 'danmaku_disabled'); assert.equal(reads, 0);
+  const videoRef = await open(f); f.config.danmakuEnabled = true;
+  for (const args of [{ toSeconds: 61 }, { fromSeconds: -1 }, { fromSeconds: '1' }, { part: 2 }, { toSeconds: 121 }])
+    assert.equal((await f.runtime.read('danmaku', { videoRef, ...args }, session) as any).content.error.code, 'invalid_input');
+  assert.equal(reads, 0);
+  const result: any = await f.runtime.read('danmaku', { videoRef }, session);
+  assert.equal(result.content.data.items.length, 100); assert.equal(result.content.data.nextOffset, 100); assert.equal(result.content.data.untrusted, true);
+  assert.equal(JSON.stringify(result.receipt).includes('SYNTHETIC_DANMAKU'), false);
+  const second: any = await f.runtime.read('danmaku', { videoRef, offset: 100 }, session); assert.equal(second.content.data.items.length, 1); assert.equal(second.content.data.hasMore, false);
+  const original = f.client.danmaku; f.client.danmaku = async (...args) => { f.config.danmakuEnabled = false; return original(...args); };
+  assert.equal((await f.runtime.read('danmaku', { videoRef }, session) as any).content.error.code, 'danmaku_disabled'); assert.equal(f.calls, 0);
+});
+
+function coinFixture() {
+  const f = fixture(); f.login(); f.config.interactions.coin = true;
+  f.client.video = async () => ({ ...structuredClone(video), copyright: 3 }); f.client.account = async () => ({ mid: 1, name: 'Synthetic', coins: 5 });
+  let given = 0; const posts: number[] = [];
+  f.client.coins = async () => given;
+  f.client.interact = async input => { posts.push(input.coinCount!); given += input.coinCount!; return { state: 'confirmed' }; };
+  return { ...f, posts, setGiven(value: number) { given = value; } };
+}
+test('coin is cumulative, adds only missing coins, binds duplicate operation ids and survives ledger reload', async t => {
+  const f = coinFixture(); t.after(() => f.runtime.dispose()); await f.runtime.initialize(); const videoRef = await open(f);
+  const experiences = new Set<string>(); f.options.recordAction = async (_session, eventId) => { experiences.add(eventId); };
+  const call = (operationId: string, coinCount: number) => f.runtime.interact({ action: 'coin', videoRef, operationId, coinCount }, session) as Promise<any>;
+  assert.equal((await call('first', 1)).content.data.spentCoins, 1);
+  assert.equal((await call('second', 1)).content.data.duplicate, true);
+  assert.equal((await call('second', 1)).content.data.duplicate, true); assert.equal(experiences.size, 1, 'alias retries cannot create a second experience');
+  assert.equal((await call('second', 2)).content.error.code, 'invalid_input');
+  assert.equal((await call('third', 2)).content.data.spentCoins, 1); assert.deepEqual(f.posts, [1, 1]);
+  assert.equal((await call('third', 2)).content.data.spentCoins, 0);
+  assert.equal((await call('third', 1)).content.error.code, 'invalid_input', 'an earlier matching fingerprint must not mask reuse of a bound operation id');
+  const restarted = new BiliRuntime(f.client, { status: () => ({}), settings: () => ({ timeoutMs: 5000, concurrency: 2, hasProxy: false }), search: async () => ({}) }, f.options);
+  t.after(() => restarted.dispose()); await restarted.initialize();
+  const reopened: any = await restarted.read('open', { target: video.bvid }, session);
+  const duplicate: any = await restarted.interact({ action: 'coin', videoRef: reopened.content.data.videoRef, coinCount: 2, operationId: 'restart' }, session);
+  assert.equal(duplicate.content.data.duplicate, true); assert.deepEqual(f.posts, [1, 1]);
+  assert.equal(experiences.size, 2, 'the two distinct actual coin submissions have exactly two event ids');
+});
+
+test('coin validates opt-in, self target, copyright limits and balance before spending; satisfied target records no action', async t => {
+  for (const scenario of ['off', 'self', 'repost', 'balance', 'satisfied'] as const) {
+    const f = coinFixture(); t.after(() => f.runtime.dispose()); await f.runtime.initialize();
+    if (scenario === 'off') f.config.interactions.coin = false;
+    if (scenario === 'self') f.client.video = async () => ({ ...video, copyright: 1, owner: { mid: 1, name: 'Synthetic' } });
+    if (scenario === 'repost') f.client.video = async () => ({ ...video, copyright: 2 });
+    if (scenario === 'balance') f.client.account = async () => ({ mid: 1, name: 'Synthetic', coins: 0.5 });
+    if (scenario === 'satisfied') f.setGiven(2);
+    let records = 0; f.options.recordAction = async () => { records++; };
+    const result: any = await f.runtime.interact({ action: 'coin', videoRef: await open(f), coinCount: 2, operationId: 'test' }, session);
+    if (scenario === 'satisfied') { assert.equal(result.content.data.alreadySatisfied, true); assert.equal(result.content.data.spentCoins, 0); }
+    else assert.equal(result.content.error.code, { off: 'interaction_disabled', self: 'coin_self', repost: 'coin_limit', balance: 'coin_balance' }[scenario]);
+    assert.deepEqual(f.posts, []); assert.equal(records, 0);
+  }
+});
+
+test('uncertain coin submission blocks changed targets and new ids; disabling before dispatch sends nothing', async t => {
+  const f = coinFixture(); t.after(() => f.runtime.dispose()); await f.runtime.initialize(); const videoRef = await open(f);
+  let posts = 0; f.client.interact = async () => { posts++; throw new BiliError('uncertain'); };
+  const run = (operationId: string, coinCount: number) => f.runtime.interact({ action: 'coin', videoRef, operationId, coinCount }, session) as Promise<any>;
+  assert.equal((await run('first', 1)).content.state, 'uncertain');
+  assert.equal((await run('second', 2)).content.state, 'uncertain');
+  assert.equal((await run('third', 1)).content.data.state, 'uncertain'); assert.equal(posts, 1);
+  const g = coinFixture(); t.after(() => g.runtime.dispose()); await g.runtime.initialize(); const ref = await open(g);
+  g.client.coins = async () => { g.config.interactions.coin = false; return 0; };
+  assert.equal((await g.runtime.interact({ action: 'coin', videoRef: ref, operationId: 'disabled' }, session) as any).content.error.code, 'interaction_disabled'); assert.deepEqual(g.posts, []);
+});
+
 test('message center requires login and validates source before IO; reading does not enable interactions', async t => {
   const f = fixture(); t.after(() => f.runtime.dispose()); await f.runtime.initialize();
   let reads = 0;

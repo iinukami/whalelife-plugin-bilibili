@@ -6,6 +6,9 @@ import { BiliError } from './errors.ts';
 import { validateLoginUrl } from './login-url.ts';
 import { readHistoryProgress, reportHistoryPosition } from './history-client.ts';
 import type { HistoryTarget, HistoryPositionInput } from './history-client.ts';
+import { readDanmaku } from './danmaku-client.ts';
+import type { DanmakuInput } from './danmaku-client.ts';
+import { checkRefresh, getRefreshCsrf, renewCookies, confirmRefresh, refreshToken } from './refresh-client.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
@@ -192,6 +195,17 @@ export class BiliClient implements BiliClientContract {
   reportHistoryPosition(input: HistoryPositionInput, options: CallOptions) {
     return reportHistoryPosition(this.transport, input, { ...options, ...this.options(options) });
   }
+  danmaku(input: DanmakuInput, options: CallOptions) { return readDanmaku(this.transport, input, { ...options, ...this.options(options) }); }
+  checkRefresh(options: CallOptions) { return checkRefresh(this.transport, { ...options, ...this.options(options) }); }
+  refreshCsrf(timestamp: number, options: CallOptions) { return getRefreshCsrf(this.transport, timestamp, { ...options, ...this.options(options) }); }
+  renewCookies(token: string, csrf: string, options: CallOptions) { return renewCookies(this.transport, token, csrf, { ...options, ...this.options(options) }); }
+  confirmRefresh(token: string, options: CallOptions) { return confirmRefresh(this.transport, token, { ...options, ...this.options(options) }); }
+  async coins(aid: number, options: CallOptions) {
+    integer(aid); if (!options.cookie) throw new BiliError('login_required');
+    const data = apiData(await this.request('/x/web-interface/archive/coins', { aid: String(aid) }, options));
+    if (!Number.isInteger(data.multiply) || data.multiply < 0 || data.multiply > 2) throw new BiliError('malformed_response');
+    return Number(data.multiply);
+  }
   private async request(path: string, params: Record<string, string>, options: CallOptions, passport = false) {
     const url = new URL(path, passport ? PASSPORT : API); url.search = new URLSearchParams(params).toString();
     const cookie = checkedCookie(options.cookie);
@@ -276,7 +290,8 @@ export class BiliClient implements BiliClientContract {
     if (!item || !Array.isArray(data.pages) || !data.pages.length) throw new BiliError('malformed_response');
     try {
       const parts = data.pages.slice(0, 1000).map((part: any) => ({ cid: integer(part.cid), page: integer(part.page), title: plain(part.part, 500), duration: duration(part.duration) }));
-      return { ...item, cid: integer(data.cid), description: plain(data.desc, 10000), parts };
+      return { ...item, cid: integer(data.cid), description: plain(data.desc, 10000), parts,
+        ...([1, 2, 3].includes(data.copyright) ? { copyright: data.copyright as 1 | 2 | 3 } : {}) };
     } catch { throw new BiliError('malformed_response'); }
   }
   async comments(aid: number, page: number, options: CallOptions): Promise<CommentList> {
@@ -409,7 +424,8 @@ export class BiliClient implements BiliClientContract {
     if (!checkedCookie(options.cookie)) throw new BiliError('login_required');
     const data = apiData(await this.request('/x/web-interface/nav', {}, options));
     if (data.isLogin !== true) throw new BiliError('login_required');
-    try { return { mid: integer(data.mid), name: plain(data.uname, 200) }; } catch { throw new BiliError('malformed_response'); }
+    try { return { mid: integer(data.mid), name: plain(data.uname, 200),
+      ...(typeof data.money === 'number' && Number.isFinite(data.money) && data.money >= 0 ? { coins: data.money } : {}) }; } catch { throw new BiliError('malformed_response'); }
   }
   async beginLogin(options: CallOptions) {
     const data = apiData(await this.request('/x/passport-login/web/qrcode/generate', {}, { ...options, cookie: undefined }, true));
@@ -434,7 +450,8 @@ export class BiliClient implements BiliClientContract {
     });
     const cookie = checkedCookie(parts.join('; '));
     if (!cookieValue(cookie, 'SESSDATA') || !cookieValue(cookie, 'bili_jct') || !/^\d+$/.test(cookieValue(cookie, 'DedeUserID'))) throw new BiliError('malformed_response');
-    this.loginKeys.delete(key); return { state: 'confirmed', cookie };
+    const token = data.refresh_token === undefined || data.refresh_token === '' ? undefined : refreshToken(data.refresh_token);
+    this.loginKeys.delete(key); return { state: 'confirmed', cookie, ...(token ? { refreshToken: token } : {}) };
   }
   async folders(mid: number, options: CallOptions) {
     integer(mid); if (!checkedCookie(options.cookie)) throw new BiliError('login_required');
@@ -444,13 +461,16 @@ export class BiliClient implements BiliClientContract {
     return data.list.slice(0, 1000).map((item: any) => ({ id: identifier(item.id), title: plain(item.title, 200) }));
   }
   async interact(input: InteractionInput, options: CallOptions): Promise<{ state: 'confirmed'; platformId?: string }> {
-    if (!input || !['like', 'favorite', 'follow', 'comment', 'reply'].includes(input.action)) throw new BiliError('invalid_input');
+    if (!input || !['like', 'favorite', 'follow', 'comment', 'reply', 'coin'].includes(input.action)) throw new BiliError('invalid_input');
     integer(input.aid); integer(input.mid);
     if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new BiliError('invalid_input');
     const cookie = checkedCookie(options.cookie); const csrf = cookieValue(cookie, 'bili_jct');
     if (!cookie || !/^[A-Za-z0-9]{16,128}$/.test(csrf)) throw new BiliError('login_required');
     let path: string; const body: Record<string, string> = { csrf };
-    if (input.action === 'like') { path = '/x/web-interface/archive/like'; Object.assign(body, { aid: String(input.aid), like: input.enabled === false ? '2' : '1' }); }
+    if (input.action === 'coin') {
+      if (![1, 2].includes(input.coinCount!) || input.enabled === false) throw new BiliError('invalid_input');
+      path = '/x/web-interface/coin/add'; Object.assign(body, { aid: String(input.aid), multiply: String(input.coinCount), select_like: '0' });
+    } else if (input.action === 'like') { path = '/x/web-interface/archive/like'; Object.assign(body, { aid: String(input.aid), like: input.enabled === false ? '2' : '1' }); }
     else if (input.action === 'favorite') {
       path = '/x/v3/fav/resource/deal'; const folder = identifier(input.folderId);
       Object.assign(body, { rid: String(input.aid), type: '2', add_media_ids: input.enabled === false ? '' : folder, del_media_ids: input.enabled === false ? folder : '' });

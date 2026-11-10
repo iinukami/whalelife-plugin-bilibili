@@ -88,6 +88,18 @@ test('gzip and brotli decode with independent wire and decoded limits', async ()
   const declared = fixture([{ headers: { 'content-length': '200' }, body: Buffer.alloc(1) }]); await assert.rejects(declared.transport.request('https://example.com/', { ...options, maxBytes: 100 }), errorCode('too_large'));
 });
 
+test('passport POST is restricted to the two renewal endpoints and never follows redirects', async t => {
+  const f = fixture([{}, {}, { status: 302, headers: { location: 'https://passport.bilibili.com/other' } }]);
+  t.after(() => f.transport.dispose());
+  for (const path of ['/x/passport-login/web/cookie/refresh', '/x/passport-login/web/confirm/refresh'])
+    await f.transport.request('https://passport.bilibili.com' + path, { ...options, method: 'POST', body: 'synthetic=1' });
+  for (const path of ['/other', '/x/passport-login/web/cookie/refresh?x=1', '/x/passport-login/web/cookie/refresh/'])
+    await assert.rejects(f.transport.request('https://passport.bilibili.com' + path, { ...options, method: 'POST', body: 'synthetic=1' }), errorCode('unsafe_url'));
+  assert.equal(f.calls.length, 2);
+  await assert.rejects(f.transport.request('https://passport.bilibili.com/x/passport-login/web/cookie/refresh', { ...options, method: 'POST', body: 'synthetic=1' }), error => error instanceof TransportError && error.submitted);
+  assert.equal(f.calls.length, 3);
+});
+
 test('unsupported compression, incomplete bodies and transport errors fail with fixed safe messages', async () => {
   const unknown = fixture([{ headers: { 'content-encoding': 'unknown' } }]); await assert.rejects(unknown.transport.request('https://example.com/', options), errorCode('malformed_response'));
   const incomplete = fixture([{ complete: false }]); await assert.rejects(incomplete.transport.request('https://example.com/', options), errorCode('network_error'));

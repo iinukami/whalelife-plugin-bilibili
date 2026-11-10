@@ -82,9 +82,9 @@ test('video references allow only canonical Bilibili targets and parse multi-par
   for (const target of ['https://evil.example/video/' + BV, 'https://www.bilibili.com@evil.example/video/' + BV, 'file:///secret', 'BV123', 'https://www.bilibili.com/video/' + BV + '/extra'])
     await assert.rejects(f.client.video(target, {}), errorCode(target.includes('@') ? 'unsafe_url' : 'invalid_input'));
   assert.equal(f.calls.length, 0);
-  f.json({ ...item, cid: 10, desc: '合成简介', pages: [{ cid: 10, page: 1, part: 'P1', duration: 32 }, { cid: 11, page: 2, part: 'P2', duration: 20 }] });
+  f.json({ ...item, cid: 10, copyright: 3, desc: '合成简介', pages: [{ cid: 10, page: 1, part: 'P1', duration: 32 }, { cid: 11, page: 2, part: 'P2', duration: 20 }] });
   const video = await f.client.video('https://www.bilibili.com/video/' + BV + '/?p=2', {});
-  assert.equal(video.parts.length, 2); assert.equal(video.cid, 10);
+  assert.equal(video.parts.length, 2); assert.equal(video.cid, 10); assert.equal(video.copyright, 3);
   assert.equal(new URL(f.calls[0].url).searchParams.get('bvid'), BV);
 });
 
@@ -301,7 +301,7 @@ test('QR login states only return minimal selected cookies after a locally issue
     'DedeUserID=123; Path=/', 'unneeded=synthetic-tracking; Path=/',
   ] });
   const confirmed = await f.client.pollLogin(key, {}); assert.equal(confirmed.state, 'confirmed');
-  if (confirmed.state === 'confirmed') { assert.ok(confirmed.cookie.includes('SESSDATA=')); assert.equal(confirmed.cookie.includes('unneeded'), false); }
+  if (confirmed.state === 'confirmed') { assert.ok(confirmed.cookie.includes('SESSDATA=')); assert.equal(confirmed.cookie.includes('unneeded'), false); assert.equal(confirmed.refreshToken, 'synthetic-refresh-not-retained'); }
   assert.deepEqual(await f.client.pollLogin(key, {}), { state: 'expired' });
 });
 
@@ -371,6 +371,26 @@ test('five interactions encode bounded form data and explicit success while pres
     if (action === 'reply') { assert.equal(fields.get('root'), '789'); assert.equal(fields.get('parent'), '790'); }
   }
   assert.equal(f.calls.length, 5);
+});
+
+test('coin client reads existing count and balance; sends the exact delta without an attached like', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  f.json({ isLogin: true, mid: 123, uname: 'Synthetic', money: 3.5 });
+  assert.equal((await f.client.account({ cookie: COOKIE })).coins, 3.5);
+  f.json({ multiply: 1 }); assert.equal(await f.client.coins(111, { cookie: COOKIE }), 1);
+  assert.equal(new URL(f.calls.at(-1)!.url).pathname, '/x/web-interface/archive/coins');
+  for (const coinCount of [1, 2]) {
+    f.json({}); await f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount }, { cookie: COOKIE });
+    const call = f.calls.at(-1)!, form = new URLSearchParams(call.options.body);
+    assert.equal(new URL(call.url).pathname, '/x/web-interface/coin/add'); assert.equal(call.options.method, 'POST');
+    assert.equal(form.get('multiply'), String(coinCount)); assert.equal(form.get('select_like'), '0'); assert.equal(form.get('aid'), '111');
+  }
+  const count = f.calls.length;
+  for (const coinCount of [0, 3, 1.5, '1', undefined]) await assert.rejects(f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount: coinCount as number }, { cookie: COOKIE }), errorCode('invalid_input'));
+  assert.equal(f.calls.length, count);
+  for (const multiply of [undefined, -1, 3, '1']) { f.json({ multiply }); await assert.rejects(f.client.coins(111, { cookie: COOKIE }), errorCode('malformed_response')); }
+  f.queue.push(new TransportError('timeout', true)); await assert.rejects(f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount: 1 }, { cookie: COOKIE }), errorCode('uncertain'));
+  assert.equal(f.calls.length, count + 5);
 });
 
 test('uncertain mutations never retry; clear preflight failures and platform rejections stay distinct', async () => {
