@@ -9,7 +9,7 @@ export const actions: readonly Action[] = ['like', 'favorite', 'follow', 'commen
 export const defaults: Config = {
   audioEnabled: false,
   historySyncEnabled: false,
-  danmakuEnabled: false, autoRefreshEnabled: false,
+  danmakuEnabled: false, autoRefreshEnabled: false, shareToQQEnabled: false,
   interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
   favoriteFolderId: '', maxMediaBytes: 64 * 1024 * 1024, referenceTtlSeconds: 600,
 };
@@ -23,10 +23,10 @@ function bounded(value: unknown, minimum: number, maximum: number): number {
 }
 export function updateConfig(value: unknown, current: Config): Config {
   const input = record(value);
-  const allowed = new Set(['audioEnabled', 'historySyncEnabled', 'danmakuEnabled', 'autoRefreshEnabled', 'interactions', 'favoriteFolderId', 'maxMediaBytes', 'referenceTtlSeconds']);
+  const allowed = new Set(['audioEnabled', 'historySyncEnabled', 'danmakuEnabled', 'autoRefreshEnabled', 'shareToQQEnabled', 'interactions', 'favoriteFolderId', 'maxMediaBytes', 'referenceTtlSeconds']);
   for (const key of Object.keys(input)) if (!allowed.has(key)) throw new BiliError('config_invalid');
   const next: Config = { ...current, interactions: { ...current.interactions } };
-  for (const key of ['danmakuEnabled', 'autoRefreshEnabled'] as const) if (Object.hasOwn(input, key)) {
+  for (const key of ['danmakuEnabled', 'autoRefreshEnabled', 'shareToQQEnabled'] as const) if (Object.hasOwn(input, key)) {
     if (typeof input[key] !== 'boolean') throw new BiliError('config_invalid'); next[key] = input[key];
   }
   if (Object.hasOwn(input, 'audioEnabled')) {

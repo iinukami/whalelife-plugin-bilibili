@@ -6,8 +6,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { MultimodalToolOutput, OptionalService, ToolSession, TransientToolOutput } from 'whalelife';
 import { BiliError, object, safeError } from './errors.ts';
 import { HistorySync } from './history-sync.ts';
+import { QQSharing } from './qq-share.ts';
 import type { HistoryOutcome } from './history-sync.ts';
-import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, NotificationTarget, PreparedMedia, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
+import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, NotificationTarget, PreparedMedia, QQMiniAppShareService, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
 
 type Ref = { session: string; account: string; expires: number; video: VideoItem | VideoDetails; comment?: CommentItem };
 type NotificationPageRef = { session: string; account: string; expires: number; source: NotificationSource; cursor: NotificationCursor };
@@ -45,8 +46,13 @@ export class BiliRuntime {
   private surf: SurfService;
   private options: RuntimeOptions;
   private history: HistorySync;
+  private qq: QQSharing;
   constructor(client: BiliClientContract, surf: SurfService, options: RuntimeOptions) {
     this.client = client; this.surf = surf; this.options = options; this.now = options.now ?? Date.now;
+    this.qq = new QQSharing({ signal: AbortSignal.any([options.signal, this.controller.signal]), guard: () => this.guard(),
+      enabled: () => this.options.config().shareToQQEnabled, video: (ref, sessionId) => {
+        const value = this.get(ref, sessionId); if (value.comment) throw new BiliError('invalid_input'); return value.video;
+      } });
     this.history = new HistorySync(client, { config: options.config, account: options.account, identity: () => this.identity(), now: this.now,
       check: (identity, callOptions) => this.checkOperation(identity, callOptions), readLedger: options.readHistoryLedger ?? (async () => ({})),
       saveLedger: options.saveHistoryLedger ?? (async () => { throw new BiliError('persistence_error'); }), record: options.recordHistory });
@@ -72,7 +78,11 @@ export class BiliRuntime {
   status() { return { ready: this.options.transient, vision: Boolean(this.vision && !this.vision.signal.aborted), audioEnabled: this.options.config().audioEnabled,
     interactions: { ...this.options.config().interactions }, historySyncEnabled: this.options.config().historySyncEnabled, historyLedgerReady: this.history.ready,
     danmakuEnabled: this.options.config().danmakuEnabled, autoRefreshEnabled: this.options.config().autoRefreshEnabled,
-    ledgerReady: this.ledgerReady, activeRequests: this.active, platformNetwork: 'direct' }; }
+    shareToQQEnabled: this.options.config().shareToQQEnabled, qqShareAvailable: this.qq.available,
+    ledgerReady: this.ledgerReady, activeRequests: this.active + this.qq.activeRequests, platformNetwork: 'direct' }; }
+  setQQ(binding?: OptionalService<QQMiniAppShareService>) { this.qq.set(binding); }
+  invalidateQQShares() { this.qq.invalidate(); }
+  shareToQQ(raw: unknown, session: ToolSession, query = false) { return this.qq.share(raw, session, query); }
   setVision(binding?: OptionalService<VisionService>) { this.vision = binding; for (const ref of this.media.values()) void this.release(ref); this.media.clear(); this.pendingMedia.clear(); }
   invalidateHistoryProofs() { this.history.clearProofs(); }
   private identity() { return this.options.accountRevision?.() ?? this.options.account()?.revision ?? 'anonymous'; }

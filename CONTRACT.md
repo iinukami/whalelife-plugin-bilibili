@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.1.8，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.0，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -17,8 +17,18 @@
 | bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件及实际覆盖说明 |
 | bilibili_mark_history | watchRef、稳定operationId；需登录、historySyncEnabled与full权限，仅提交已有真实采样凭据对应的位置 |
 | bilibili_interact | action仅限like/favorite/follow/comment/reply、operationId、videoRef或commentRef，以及评论/回复text；受独立开关、账号与full权限约束 |
+| bilibili_share_qq | videoRef、userId、operationId；需shareToQQEnabled、full权限及兼容QQ服务，分享当前会话视频的小程序卡片 |
+| bilibili_share_qq_delivery | userId、原operationId；查询同一可信会话的QQ发送回执，不发送；关闭开关或引用过期后仍可查 |
 
 普通结果为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。不能用工具外层 `ok` 当作平台成功。互动结果明确 `confirmed|rejected|uncertain`，重复请求给 `duplicate:true`；pending重启记录视为uncertain，不发远端请求。稳定 operationId 及内容指纹共同防重发，记录中不保存评论正文或凭据。
+
+QQ 分享仅在 `ctx.optional('qq')` 绑定有效且 `miniAppShareApiVersion === '1.0.0'`、`sendMiniAppShare/miniAppShareDelivery` 均存在时注册临时工具。提供方契约见 QQ 插件的公开 `MINIAPP-SHARING.md`；本插件仅保留类型副本。`qqShareAvailable` 表示服务兼容且绑定有效，不代表QQ在线或收件人可发。旧QQ或旧宿主只缺此能力，不影响既有浏览；QQ停止撤销分享工具并取消在途调用，不重放。
+
+`shareToQQEnabled` 默认false；关闭会取消在途分享，查询仍可用。发送参数严格只接受videoRef/userId/operationId，查询只接受userId/operationId；sessionId、personaId、permission均来自可信工具会话。operationId为1–96位ASCII字母、数字、点、下划线、冒号或短横线，向QQ加 `bilibili:` 前缀。userId为5–20位非零开头数字字符串，QQ进一步核对好友白名单和非自身。发送由有效且同账号代际的视频引用取得标题、UP主、BV、aid及hdslb.com封面，构造 `pages/video/video?avid=<aid>` 与规范B站webUrl，不接受模型填写外部卡片字段。不做B站网络请求、登录续期、视频下载或统计上报。标题和封面属于外部资料，不构成发送授权。
+
+QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有效平台消息ID才confirmed；not_found仅用于查询。固定 `retryAutomatically:false/canRetry:false`，无自动重试、文本回退或换ID补发。持久防重记录属于QQ插件，原动作跨B站插件重载仍可查询；B站插件不另存标题、链接或签名。异常跨过提供方调用边界后保守报uncertain，已可靠确认发送的回执不因随后取消改成未发。仅投影预期字段及固定安全错误，不把提供方原始异常、ARK或外部正文写入回执。
+
+签名卡片经QQ本机NapCat生成，不是自动点击腾讯网页分享控件。`get_mini_app_ark` 在本轮核验的 NapCat 4.18.41 中存在；小程序 avid 路径来自已记录的平台响应，当前真实客户端的展示和点击仍待验收。QQ发送成功只证明平台确认，不能替代收件端验证。
 
 确认的互动通过 `memory.recordExperience` 记录固定动作说明；事件标识使用动作散列，重复补记幂等。记忆失败只影响 `experienceRecorded`，不把已经完成的外部动作重新提交。
 

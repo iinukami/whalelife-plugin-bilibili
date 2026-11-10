@@ -5,7 +5,7 @@
 import type { HistoryTarget, HistoryPositionInput, HistoryProgress } from './history-client.ts';
 import type { DanmakuInput, DanmakuResult } from './danmaku-client.ts';
 export type Action = 'like' | 'favorite' | 'follow' | 'comment' | 'reply';
-export interface Config { audioEnabled: boolean; historySyncEnabled: boolean; danmakuEnabled: boolean; autoRefreshEnabled: boolean; interactions: Record<Action, boolean>; favoriteFolderId: string; maxMediaBytes: number; referenceTtlSeconds: number }
+export interface Config { audioEnabled: boolean; historySyncEnabled: boolean; danmakuEnabled: boolean; autoRefreshEnabled: boolean; shareToQQEnabled: boolean; interactions: Record<Action, boolean>; favoriteFolderId: string; maxMediaBytes: number; referenceTtlSeconds: number }
 export interface CallOptions { signal?: AbortSignal; cookie?: string; timeoutMs?: number }
 export interface VideoItem { bvid: string; aid: number; title: string; owner: { mid: number; name: string }; duration: number; cover: string; url: string }
 export interface VideoDetails extends VideoItem { cid: number; description: string; copyright?: 1 | 2 | 3; parts: { cid: number; page: number; title: string; duration: number }[] }
@@ -55,6 +55,20 @@ export interface BiliClientContract {
   dispose(): void | Promise<void>;
 }
 export interface SurfService { status(): unknown; settings(): { timeoutMs: number; concurrency: number; hasProxy: boolean }; search(input: { sessionId: string; query: string; limit?: number }, options?: { signal?: AbortSignal }): Promise<unknown> }
+/** Consumer copy of QQ's public mini-app sharing contract. No provider implementation import. */
+export interface QQMiniAppShareKey { userId: string; actionId: string; sessionId: string }
+export interface QQMiniAppShareInput extends QQMiniAppShareKey {
+  personaId?: string; preset: 'bili'; title: string; description: string; previewUrl: string; jumpPath: string; webUrl: string;
+}
+export interface QQMiniAppShareReceipt {
+  status: 'sent' | 'not_sent' | 'uncertain' | 'not_found'; confirmed: boolean; duplicate?: boolean;
+  retryAutomatically: false; canRetry: false; platformMessageId?: string; ledgerSaved?: boolean; error?: string;
+}
+export interface QQMiniAppShareService {
+  readonly miniAppShareApiVersion?: string;
+  sendMiniAppShare(input: QQMiniAppShareInput, options: { signal?: AbortSignal; permission: 'full' }): Promise<QQMiniAppShareReceipt> | QQMiniAppShareReceipt;
+  miniAppShareDelivery(input: QQMiniAppShareKey): Promise<QQMiniAppShareReceipt> | QQMiniAppShareReceipt;
+}
 export interface VisionService {
   readonly audiovisualApiVersion?: string;
   status(): { audiovisualApiVersion?: string };

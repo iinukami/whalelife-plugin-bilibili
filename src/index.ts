@@ -11,7 +11,7 @@ import { defaults, parseConfig, updateConfig } from './config.ts';
 import { BiliError, object, safeError } from './errors.ts';
 import { BiliRuntime } from './runtime.ts';
 import { settingsPage } from './page.ts';
-import type { BiliClientContract, Config, SurfService, VisionService } from './types.ts';
+import type { BiliClientContract, Config, QQMiniAppShareService, SurfService, VisionService } from './types.ts';
 
 export interface Dependencies { client?: BiliClientContract; now?: () => number }
 export async function apply(ctx: Context) { return applyWithDependencies(ctx); }
@@ -69,6 +69,19 @@ export async function applyWithDependencies(ctx: Context, dependencies: Dependen
       run: (args, session) => runtime.watch(args, session) }));
   });
 
+  if (transient && typeof ctx.optional === 'function') ctx.optional<QQMiniAppShareService>('qq', binding => {
+    runtime.setQQ(binding);
+    if (!binding || binding.service.miniAppShareApiVersion !== '1.0.0' || typeof binding.service.sendMiniAppShare !== 'function' || typeof binding.service.miniAppShareDelivery !== 'function') return;
+    binding.effect(() => ctx.tools.registerTransient({ name: 'bilibili_share_qq', danger: 'full',
+      schema: shape({ videoRef: text, userId: text, operationId: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,96}$' } }, ['videoRef', 'userId', 'operationId']),
+      description: '将已浏览的 B 站视频作为带标题、封面的 QQ 小程序卡片发给指定好友。需用户开启分享到 QQ、当前会话full权限及QQ好友白名单；仅用于用户明确授权或安排的发送，收件人用qq_list_recipients核对。标题和封面来自当前会话videoRef，不能自行填写。operationId为稳定动作ID，重复或uncertain时先查bilibili_share_qq_delivery，不换ID重发、不自动改成文本补发。confirmed只证明QQ确认发送，不证明对方看到或卡片能打开。发送成功后不要再用普通回复重复发送相同卡片。',
+      run: (args, session) => runtime.shareToQQ(args, session) }));
+    binding.effect(() => ctx.tools.registerTransient({ name: 'bilibili_share_qq_delivery', danger: 'safe',
+      schema: shape({ userId: text, operationId: { type: 'string', pattern: '^[A-Za-z0-9._:-]{1,96}$' } }, ['userId', 'operationId']),
+      description: '查询本会话此前分享B站视频到QQ的发送回执，不发送消息。使用原收件人及operationId；关闭分享开关或videoRef过期后仍可查询。uncertain不自动重发，not_found也不代表远端绝对没有收到。',
+      run: (args, session) => runtime.shareToQQ(args, session, true) }));
+  });
+
   let revision = randomUUID();
   const base = '/plugins/surf/bilibili';
   const wrap = (handler: PluginHandler): PluginHandler => async (req, res, context) => {
@@ -103,6 +116,7 @@ export async function applyWithDependencies(ctx: Context, dependencies: Dependen
       const next = updateConfig(body.config, config);
       await ctx.config.save('config.json', next);
       if (config.historySyncEnabled !== next.historySyncEnabled) runtime.invalidateHistoryProofs();
+      if (config.shareToQQEnabled && !next.shareToQQEnabled) runtime.invalidateQQShares();
       auth.configureRefresh(next.autoRefreshEnabled);
       config = next; configValid = true; revision = randomUUID();
       return { config, revision, configValid, reloadRequired: !runtime.status().ready };
