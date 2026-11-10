@@ -393,6 +393,16 @@ test('coin client reads existing count and balance; sends the exact delta withou
   assert.equal(f.calls.length, count + 5);
 });
 
+test('coin captcha rejection code -401 reports access_blocked without replaying the request', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  f.json({}, -401);
+  await assert.rejects(f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount: 1 }, { cookie: COOKIE }), errorCode('access_blocked'));
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].options.method, 'POST');
+  assert.equal(new URL(f.calls[0].url).pathname, '/x/web-interface/coin/add');
+  assert.equal(new URLSearchParams(f.calls[0].options.body).get('multiply'), '1');
+});
+
 test('uncertain mutations never retry; clear preflight failures and platform rejections stay distinct', async () => {
   const f = fixture(); const input = { action: 'like' as const, aid: 111, mid: 123 };
   f.queue.push(new TransportError('timeout', true)); await assert.rejects(f.client.interact(input, { cookie: COOKIE }), errorCode('uncertain')); assert.equal(f.calls.length, 1);

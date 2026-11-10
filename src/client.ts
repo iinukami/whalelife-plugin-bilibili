@@ -166,7 +166,7 @@ function parseJson(response: TransportResponse) {
 function apiData(response: TransportResponse): Record<string, any> {
   const json = parseJson(response);
   if (json.code === -101 || json.code === -111 || json.code === -400 && json.message === '账号未登录') throw new BiliError('login_required');
-  if ([-352, -412, -509, -799].includes(json.code)) throw new BiliError('access_blocked');
+  if ([-352, -401, -412, -509, -799].includes(json.code)) throw new BiliError('access_blocked');
   if (json.code !== 0) throw new BiliError(typeof json.code === 'number' ? 'platform_error' : 'malformed_response');
   return json.data == null ? {} : record(json.data);
 }

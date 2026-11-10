@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.1.6，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.1.7，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
