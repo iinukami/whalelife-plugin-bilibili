@@ -199,9 +199,8 @@ export async function apply(ctx) {
     async subtitle(url, options) { record('subtitle', options); return [{from:1,to:3,text:${JSON.stringify(RAW_SUBTITLE)}}]; },
     async media(bvid, cid, maxBytes, options) { record('media', options); return {bytes:Buffer.from('SYNTHETIC_MP4_NOT_A_REAL_VIDEO'),mime:'video/mp4'}; },
     async image(url, maxBytes, options) { record('image', options); throw Error('Image is not part of this fixture'); },
-    async account(options) { record('account', options); if (!options.cookie) throw new BiliError('login_required'); return {mid:4321,name:'Synthetic account',coins:5}; },
+    async account(options) { record('account', options); if (!options.cookie) throw new BiliError('login_required'); return {mid:4321,name:'Synthetic account'}; },
     async danmaku(input, options) { record('danmaku', options); return {items:[{id:'1234',atSeconds:1,mode:1,text:${JSON.stringify(RAW_DANMAKU)}}],segments:[1],excludedModes:0,truncated:false}; },
-    async coins(aid, options) { record('coins', options); return 0; },
     async checkRefresh(options) { record('refresh:check', options); return {refresh:true,timestamp:1234}; },
     async refreshCsrf(timestamp, options) { record('refresh:csrf', options); return 'SYNTHETIC_REFRESH_CSRF'; },
     async renewCookies(token, csrf, options) { record('refresh:renew', options); return {cookie:${JSON.stringify(SYNTHETIC_COOKIE)}.replace('SYNTHETIC_BILI_SESSION_SECRET','SYNTHETIC_ROTATED_SESSION'),refreshToken:'SYNTHETIC_REFRESH_NEXT'}; },
@@ -210,7 +209,7 @@ export async function apply(ctx) {
     async pollLogin(key, options) { record('pollLogin', options); return {state:'waiting'}; },
     async folders(mid, options) { record('folders', options); return [{id:'7',title:'Synthetic folder'}]; },
     async interact(input, options) { record('interact', options);
-      submissions.push({action:input.action,aid:input.aid,mid:input.mid,root:input.root,parent:input.parent,...(input.action==='coin'?{coinCount:input.coinCount}:{})});
+      submissions.push({action:input.action,aid:input.aid,mid:input.mid,root:input.root,parent:input.parent});
       return {state:'confirmed',platformId:'123456789'}; },
     dispose() { disposed = true; }
   };

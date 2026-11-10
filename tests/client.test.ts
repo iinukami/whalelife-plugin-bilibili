@@ -373,34 +373,21 @@ test('five interactions encode bounded form data and explicit success while pres
   assert.equal(f.calls.length, 5);
 });
 
-test('coin client reads existing count and balance; sends the exact delta without an attached like', async t => {
+test('removed coin action and stale coinCount reject before transport dispatch', async t => {
   const f = fixture(); t.after(() => f.client.dispose());
-  f.json({ isLogin: true, mid: 123, uname: 'Synthetic', money: 3.5 });
-  assert.equal((await f.client.account({ cookie: COOKIE })).coins, 3.5);
-  f.json({ multiply: 1 }); assert.equal(await f.client.coins(111, { cookie: COOKIE }), 1);
-  assert.equal(new URL(f.calls.at(-1)!.url).pathname, '/x/web-interface/archive/coins');
-  for (const coinCount of [1, 2]) {
-    f.json({}); await f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount }, { cookie: COOKIE });
-    const call = f.calls.at(-1)!, form = new URLSearchParams(call.options.body);
-    assert.equal(new URL(call.url).pathname, '/x/web-interface/coin/add'); assert.equal(call.options.method, 'POST');
-    assert.equal(form.get('multiply'), String(coinCount)); assert.equal(form.get('select_like'), '0'); assert.equal(form.get('aid'), '111');
-  }
-  const count = f.calls.length;
-  for (const coinCount of [0, 3, 1.5, '1', undefined]) await assert.rejects(f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount: coinCount as number }, { cookie: COOKIE }), errorCode('invalid_input'));
-  assert.equal(f.calls.length, count);
-  for (const multiply of [undefined, -1, 3, '1']) { f.json({ multiply }); await assert.rejects(f.client.coins(111, { cookie: COOKIE }), errorCode('malformed_response')); }
-  f.queue.push(new TransportError('timeout', true)); await assert.rejects(f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount: 1 }, { cookie: COOKIE }), errorCode('uncertain'));
-  assert.equal(f.calls.length, count + 5);
+  for (const input of [{ action: 'coin', aid: 111, mid: 456 }, { action: 'coin', aid: 111, mid: 456, coinCount: 1 }, { action: 'like', aid: 111, mid: 456, coinCount: 1 }])
+    await assert.rejects(f.client.interact(input as any, { cookie: COOKIE }), errorCode('invalid_input'));
+  assert.equal(f.calls.length, 0);
+  assert.equal('coins' in f.client, false);
 });
 
-test('coin captcha rejection code -401 reports access_blocked without replaying the request', async t => {
+test('captcha rejection code -401 reports access_blocked without replaying the request', async t => {
   const f = fixture(); t.after(() => f.client.dispose());
   f.json({}, -401);
-  await assert.rejects(f.client.interact({ action: 'coin', aid: 111, mid: 456, coinCount: 1 }, { cookie: COOKIE }), errorCode('access_blocked'));
+  await assert.rejects(f.client.interact({ action: 'like', aid: 111, mid: 456 }, { cookie: COOKIE }), errorCode('access_blocked'));
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0].options.method, 'POST');
-  assert.equal(new URL(f.calls[0].url).pathname, '/x/web-interface/coin/add');
-  assert.equal(new URLSearchParams(f.calls[0].options.body).get('multiply'), '1');
+  assert.equal(new URL(f.calls[0].url).pathname, '/x/web-interface/archive/like');
 });
 
 test('uncertain mutations never retry; clear preflight failures and platform rejections stay distinct', async () => {

@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.1.7，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.1.8，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -16,7 +16,7 @@
 | bilibili_danmaku | videoRef、可选part/fromSeconds/toSeconds/offset；需danmakuEnabled，默认0–30秒、窗口最多60秒，100条一页 |
 | bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件及实际覆盖说明 |
 | bilibili_mark_history | watchRef、稳定operationId；需登录、historySyncEnabled与full权限，仅提交已有真实采样凭据对应的位置 |
-| bilibili_interact | action、operationId、videoRef或commentRef，以及评论/回复text或投币coinCount；受独立开关、账号与full权限约束 |
+| bilibili_interact | action仅限like/favorite/follow/comment/reply、operationId、videoRef或commentRef，以及评论/回复text；受独立开关、账号与full权限约束 |
 
 普通结果为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。不能用工具外层 `ok` 当作平台成功。互动结果明确 `confirmed|rejected|uncertain`，重复请求给 `duplicate:true`；pending重启记录视为uncertain，不发远端请求。稳定 operationId 及内容指纹共同防重发，记录中不保存评论正文或凭据。
 
@@ -40,8 +40,8 @@ MP4 下载前先校验主地址；若不通过，只检查同一播放响应中�
 
 平台HTTP/JSON数据结构仅在本插件内适配，版本变化以明确错误报告。缺少宿主临时工具时停用浏览，缺少视觉只关闭观看。插件停止撤销入口并取消所属请求；已经确认的远端动作不伪装撤销、不自动重放。
 
-`danmakuEnabled`、`interactions.coin`、`autoRefreshEnabled` 均默认false，旧配置缺字段按false迁移。弹幕仅经safe临时工具返回文字、精确字符串id与视频秒数；时间窗为[from,to)，获取必要的6分钟分段，每段限2MiB/12000条，只保留模式1–6，最多返回12000条，每页100条，每条最多500字。truncated表明裁切，excludedModes统计窗口内未返回的特殊模式；不暴露发送者哈希，不执行代码弹幕，不能视为全量历史。无需vision/声音，不自动记历史。
+`danmakuEnabled`、`autoRefreshEnabled` 均默认false，旧配置缺字段按false迁移。弹幕仅经safe临时工具返回文字、精确字符串id与视频秒数；时间窗为[from,to)，获取必要的6分钟分段，每段限2MiB/12000条，只保留模式1–6，最多返回12000条，每页100条，每条最多500字。truncated表明裁切，excludedModes统计窗口内未返回的特殊模式；不暴露发送者哈希，不执行代码弹幕，不能视为全量历史。无需vision/声音，不自动记历史。
 
-投币仍经full的bilibili_interact，coinCount是累计目标1或2（默认1），不是每次追加枚数。先回查视频、版权类型、已投数及账号余额，差额为0时alreadySatisfied且spentCoins=0，不记新增互动经历；实际提交仅补差额并固定select_like=0。平台类型1/3最多2、类型2最多1；未知类型、自己的视频及不足余额在提交前停止。持久记录绑定账号与视频，pending/uncertain阻止换ID或改目标绕过；确定失败可在问题解决后用新动作请求。无跨设备事务保证。
+0.1.8 移除投币能力，`bilibili_interact` 不再支持 `action=coin`，工具契约不再提供 `coinCount`。旧配置中的 `interactions.coin` 只作兼容读取并忽略，不返回为可用开关。旧 `data/actions.json` 中的投币记录及其字段继续兼容并保留；不因移除功能清空账本，也不重放旧投币动作。其余五项互动仍独立默认关闭，弹幕与自动续期不受影响。
 
 自动续期由账号管理器在业务请求前按需检查（不是后台监控）。成功检查24小时内不重复，检查失败15分钟冷却，重启不保留检查间隔。QR确认保存refresh_token；Cookie导入可选refreshToken，未提供时不能自动续期。固定cookie/info与correspond请求取得续期信息，pending先保存，然后提交cookie/refresh、校验同一账号、保存新Cookie及token，再confirm/refresh旧token，最后清除标记。中断标记重启按uncertain处理且不重放；本地无法确认完成时请重新登录。仅两个固定passport路径允许POST，凭据只保存在account.json，不返回模型、页面、回执、日志。state/status的renewal仅含enabled/available/status/lastCheckedAt；GET状态不发平台请求。凭据轮换改变编辑revision但保留当前运行中的账号身份代际；人工账号变更仍失效旧引用。关闭开关或停止会取消后续步骤，不能撤销已提交的远端变化。

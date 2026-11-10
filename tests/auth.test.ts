@@ -93,11 +93,22 @@ test('AuthManager rejects unapproved QR destinations even when a client adapter 
   assert.equal(f.auth.state().loggedIn, false); assert.equal(f.writes.length, 0);
 });
 
+test('legacy coin settings are ignored on load and cannot be enabled through updates', () => {
+  const legacy = { audioEnabled: true, interactions: { coin: true, comment: true, reply: false } };
+  const parsed = parseConfig(legacy);
+  assert.equal(Object.hasOwn(parsed.interactions, 'coin'), false);
+  assert.equal(parsed.audioEnabled, true);
+  assert.equal(parsed.interactions.comment, true);
+  assert.equal(parsed.interactions.reply, false);
+  assert.equal(legacy.interactions.coin, true, 'loading must not mutate the saved settings object');
+  for (const coin of [true, false]) assert.throws(() => updateConfig({ interactions: { coin } }, parsed), errorCode('config_invalid'));
+});
+
 test('configuration defaults keep audio and every interaction disabled; partial updates preserve independent settings', () => {
   const config = parseConfig({});
-  assert.equal(config.danmakuEnabled, false); assert.equal(config.autoRefreshEnabled, false); assert.equal(config.interactions.coin, false);
-  const optional = updateConfig({ danmakuEnabled: true, interactions: { coin: true } }, config);
-  assert.equal(optional.danmakuEnabled, true); assert.equal(optional.interactions.coin, true); assert.equal(optional.autoRefreshEnabled, false); assert.equal(optional.audioEnabled, false);
+  assert.equal(config.danmakuEnabled, false); assert.equal(config.autoRefreshEnabled, false); assert.equal(Object.hasOwn(config.interactions, 'coin'), false);
+  const optional = updateConfig({ danmakuEnabled: true }, config);
+  assert.equal(optional.danmakuEnabled, true); assert.equal(optional.autoRefreshEnabled, false); assert.equal(optional.audioEnabled, false);
   assert.equal(config.audioEnabled, false);
   assert.ok(Object.values(config.interactions).every(value => value === false));
   const changed = updateConfig({ interactions: { comment: true }, favoriteFolderId: '301' }, config);

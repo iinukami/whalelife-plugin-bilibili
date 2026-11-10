@@ -5,12 +5,12 @@
 import type { Action, Config } from './types.ts';
 import { BiliError } from './errors.ts';
 
-export const actions: readonly Action[] = ['like', 'favorite', 'follow', 'comment', 'reply', 'coin'];
+export const actions: readonly Action[] = ['like', 'favorite', 'follow', 'comment', 'reply'];
 export const defaults: Config = {
   audioEnabled: false,
   historySyncEnabled: false,
   danmakuEnabled: false, autoRefreshEnabled: false,
-  interactions: { like: false, favorite: false, follow: false, comment: false, reply: false, coin: false },
+  interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
   favoriteFolderId: '', maxMediaBytes: 64 * 1024 * 1024, referenceTtlSeconds: 600,
 };
 function record(value: unknown): Record<string, unknown> {
@@ -52,4 +52,11 @@ export function updateConfig(value: unknown, current: Config): Config {
   if (Object.hasOwn(input, 'referenceTtlSeconds')) next.referenceTtlSeconds = bounded(input.referenceTtlSeconds, 30, 1800);
   return next;
 }
-export function parseConfig(value: unknown): Config { return updateConfig(value === undefined ? {} : value, defaults); }
+export function parseConfig(value: unknown): Config {
+  const input = record(value === undefined ? {} : value);
+  if (!Object.hasOwn(input, 'interactions')) return updateConfig(input, defaults);
+  // Ignore the removed option when loading old settings; new updates still reject it.
+  const interactions = { ...record(input.interactions) };
+  delete interactions.coin;
+  return updateConfig({ ...input, interactions }, defaults);
+}

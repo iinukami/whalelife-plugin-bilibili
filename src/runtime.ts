@@ -13,8 +13,9 @@ type Ref = { session: string; account: string; expires: number; video: VideoItem
 type NotificationPageRef = { session: string; account: string; expires: number; source: NotificationSource; cursor: NotificationCursor };
 type NotificationRef = { session: string; account: string; expires: number; videoTarget: string; target: NotificationTarget };
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
-type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string;
-  coinTargetHash?: string; coinTarget?: number; coinAmount?: number };
+// Retain historical coin records when saving the ledger; no current action creates or replays them.
+type LegacyCoinLedgerFields = { coinTargetHash?: string; coinTarget?: number; coinAmount?: number };
+type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string } & LegacyCoinLedgerFields;
 export interface RuntimeOptions {
   signal: AbortSignal; transient: boolean; config: () => Config; account: () => AccountState | undefined; accountRevision?: () => string;
   readLedger: () => Promise<unknown>; saveLedger: (value: unknown) => Promise<void>; now?: () => number;
@@ -334,10 +335,8 @@ export class BiliRuntime {
     let submitted = false;
     try {
       const args = object(raw), action = string(args.action) as Action;
-      if (!['like', 'favorite', 'follow', 'comment', 'reply', 'coin'].includes(action)) throw new BiliError('invalid_input');
+      if (!['like', 'favorite', 'follow', 'comment', 'reply'].includes(action) || 'coinCount' in args) throw new BiliError('invalid_input');
       if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
-      const coinTarget = action === 'coin' ? integer(args.coinCount, 1, 1, 2) : undefined;
-      if (action !== 'coin' && args.coinCount !== undefined) throw new BiliError('invalid_input');
       const data = await this.operation(session, async (id, options) => {
         if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
         if (!this.ledgerReady) throw new BiliError('persistence_error');
@@ -350,65 +349,39 @@ export class BiliRuntime {
         if (action === 'favorite' && !folderId) throw new BiliError('folder_required');
         const key = hash([account.mid, id, op]);
         const payload = [account.mid, action, ref.video.aid, ref.video.owner.mid, ref.comment?.rpid, folderId, text];
-        const fingerprint = hash(action === 'coin' ? [...payload, coinTarget] : payload);
-        const coinTargetHash = action === 'coin' ? hash([account.mid, 'coin', ref.video.aid]) : undefined;
+        const fingerprint = hash(payload);
         const previous = this.ledger.find(e => e.key === key) ?? this.ledger.find(e => e.state !== 'rejected' && e.fingerprint === fingerprint);
         if (previous?.key === key && previous.fingerprint !== fingerprint) throw new BiliError('invalid_input');
         if (previous) {
-          if (action === 'coin' && previous.key !== key) {
-            if (this.ledger.length >= 4096) throw new BiliError('busy');
-            this.ledger.push({ ...previous, key });
-            try { await this.options.saveLedger({ entries: this.ledger }); } catch { this.ledgerReady = false; throw new BiliError('persistence_error'); }
-          }
-          if (previous.state === 'confirmed' && previous.coinAmount !== 0) await this.options.recordAction?.(id, action === 'coin' ? previous.fingerprint : previous.key, action).catch(() => {});
-          return { state: previous.state === 'pending' ? 'uncertain' : previous.state, duplicate: true, platformId: previous.platformId,
-            ...(action === 'coin' ? { coinTarget, spentCoins: 0 } : {}) };
+          if (previous.state === 'confirmed') await this.options.recordAction?.(id, previous.key, action).catch(() => {});
+          return { state: previous.state === 'pending' ? 'uncertain' : previous.state, duplicate: true, platformId: previous.platformId };
         }
-        if (coinTargetHash && this.ledger.some(e => e.coinTargetHash === coinTargetHash && ['pending', 'uncertain'].includes(e.state))) throw new BiliError('uncertain');
         if (this.ledger.length >= 4096) throw new BiliError('busy');
         const verified = await this.client.account(options);
         if (verified.mid !== account.mid || this.identity() !== account.revision) throw new BiliError('account_changed');
         if (action === 'favorite' && !(await this.client.folders(account.mid, options)).some(folder => folder.id === folderId)) throw new BiliError('folder_required');
-        let coinAmount: number | undefined;
-        if (action === 'coin') {
-          const latest = await this.client.video(ref.video.bvid, options); this.checkOperation(account.revision, options);
-          if (latest.aid !== ref.video.aid || latest.owner.mid !== ref.video.owner.mid) throw new BiliError('comment_mismatch');
-          if (latest.owner.mid === account.mid) throw new BiliError('coin_self');
-          if (![1, 2, 3].includes(latest.copyright!)) throw new BiliError('malformed_response');
-          // The current official web player treats both copyright 1 and 3 as two-coin videos.
-          const maximum = latest.copyright === 2 ? 1 : 2;
-          if (coinTarget! > maximum) throw new BiliError('coin_limit');
-          const given = await this.client.coins(latest.aid, options); this.checkOperation(account.revision, options);
-          if (!Number.isInteger(given) || given < 0 || given > 2) throw new BiliError('malformed_response');
-          coinAmount = Math.max(0, coinTarget! - given);
-          if (coinAmount > 0 && (verified.coins === undefined || !Number.isFinite(verified.coins))) throw new BiliError('malformed_response');
-          if (coinAmount > 0 && verified.coins! < coinAmount) throw new BiliError('coin_balance');
-        }
         if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
         options.signal?.throwIfAborted();
-        entry = { key, fingerprint, state: coinAmount === 0 ? 'confirmed' : 'pending',
-          ...(coinTargetHash ? { coinTargetHash, coinTarget, coinAmount } : {}) }; this.ledger.push(entry);
+        entry = { key, fingerprint, state: 'pending' }; this.ledger.push(entry);
         try { await this.options.saveLedger({ entries: this.ledger }); }
         catch { this.ledgerReady = false; throw new BiliError('persistence_error'); }
         options.signal?.throwIfAborted();
         if (this.identity() !== account.revision) throw new BiliError('account_changed');
         if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
-        if (coinAmount === 0) return { state: 'confirmed' as const, alreadySatisfied: true, coinTarget, spentCoins: 0 };
         submitted = true;
-        const result = await this.client.interact({ action, aid: ref.video.aid, mid: ref.video.owner.mid, enabled: true, folderId, text, ...(coinAmount ? { coinCount: coinAmount } : {}),
+        const result = await this.client.interact({ action, aid: ref.video.aid, mid: ref.video.owner.mid, enabled: true, folderId, text,
           ...(ref.comment ? { parent: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root } : {}) }, options);
         entry.state = 'confirmed'; entry.platformId = result.platformId;
         let ledgerSaved = true;
         try { await this.options.saveLedger({ entries: this.ledger }); } catch { this.ledgerReady = false; ledgerSaved = false; }
         let experienceRecorded = false;
-        if (this.options.recordAction) { try { await this.options.recordAction(id, action === 'coin' ? fingerprint : key, action); experienceRecorded = true; } catch { /* The action remains confirmed; never submit it again to repair memory. */ } }
-        return { ...result, ledgerSaved, experienceRecorded, ...(action === 'coin' ? { coinTarget, spentCoins: coinAmount } : {}) };
+        if (this.options.recordAction) { try { await this.options.recordAction(id, key, action); experienceRecorded = true; } catch { /* The action remains confirmed; never submit it again to repair memory. */ } }
+        return { ...result, ledgerSaved, experienceRecorded };
       });
       return { content: { status: 'ok', data }, receipt: { action: 'bilibili_interact', state: data.state, duplicate: 'duplicate' in data ? data.duplicate : false } };
     } catch (error) {
       // A confirmed external result remains confirmed even if cancellation/account change occurred afterwards.
-      if (entry?.state === 'confirmed') return { content: { status: 'ok', data: { state: 'confirmed', platformId: entry.platformId,
-        ...(entry.coinTargetHash ? { coinTarget: entry.coinTarget, spentCoins: entry.coinAmount, ...(entry.coinAmount === 0 ? { alreadySatisfied: true } : {}) } : {}) } }, receipt: { action: 'bilibili_interact', state: 'confirmed' } };
+      if (entry?.state === 'confirmed') return { content: { status: 'ok', data: { state: 'confirmed', platformId: entry.platformId } }, receipt: { action: 'bilibili_interact', state: 'confirmed' } };
       const e = safeError(error);
       if (entry) {
         entry.state = !submitted || ['platform_error', 'login_required', 'access_blocked', 'invalid_input'].includes(e.code) ? 'rejected' : 'uncertain';

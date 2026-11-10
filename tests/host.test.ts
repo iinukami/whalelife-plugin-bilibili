@@ -59,17 +59,25 @@ for (const baseline of [CURRENT_HOST, MINIMUM_HOST]) {
   });
 }
 
-test('optional danmaku, coin and renewal cross the host boundary with independent switches and private credentials', deadline, async t => {
+test('danmaku and renewal remain available while removed coin actions cannot cross the host boundary', deadline, async t => {
   const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
   const state: any = await (await f.request(prefix + '/state')).json();
   assert.equal((await f.request(prefix + '/login/import', { revision: state.account.revision, cookie: SYNTHETIC_COOKIE, refreshToken: 'SYNTHETIC_REFRESH_OLD' })).status, 200);
   const videoRef = (await f.call('bilibili_open', { target: VIDEO_ID })).result.data.videoRef;
   assert.equal((await f.call('bilibili_danmaku', { videoRef })).result.error.code, 'danmaku_disabled');
   const args = { action: 'coin', videoRef, coinCount: 2, operationId: 'synthetic-coin' };
-  assert.equal((await f.call('bilibili_interact', args)).result.error.code, 'interaction_disabled');
+  const callsBeforeCoin = (await fixture.stats()).calls.length;
+  assert.equal((await f.call('bilibili_interact', args)).result.error.code, 'invalid_input');
+  assert.equal((await fixture.stats()).calls.length, callsBeforeCoin);
+  const schema = f.app.tools.entries.get('bilibili_interact').schema;
+  assert.equal(schema.properties.action.enum.includes('coin'), false);
+  assert.equal(Object.hasOwn(schema.properties, 'coinCount'), false);
   const settings: any = await (await f.request(prefix + '/config')).json();
+  assert.equal(Object.hasOwn(settings.config.interactions, 'coin'), false);
+  assert.equal((await f.request(prefix + '/config', { revision: settings.revision, config: {
+    interactions: { coin: true } } })).status, 400);
   assert.equal((await f.request(prefix + '/config', { revision: settings.revision, config: { ...settings.config,
-    danmakuEnabled: true, autoRefreshEnabled: true, interactions: { ...settings.config.interactions, coin: true } } })).status, 200);
+    danmakuEnabled: true, autoRefreshEnabled: true } })).status, 200);
   let publicState: any = await (await f.request(prefix + '/state')).json();
   assert.equal(publicState.renewal.available, true); assert.equal((await fixture.stats()).calls.some((c: string) => c.startsWith('refresh:')), false, 'settings/status must not renew');
   const danmaku = await f.call('bilibili_danmaku', { videoRef });
@@ -77,13 +85,13 @@ test('optional danmaku, coin and renewal cross the host boundary with independen
   publicState = await (await f.request(prefix + '/state')).json(); assert.equal(publicState.renewal.status, 'refreshed');
   assert.equal((await f.app.tools.call('bilibili_interact', args, { id: f.sessionId, permission: 'ask' })).ok, false);
   assert.equal((await fixture.stats()).submissions.length, 0);
-  const coin = await f.call('bilibili_interact', args); assert.equal(coin.result.data.spentCoins, 2);
-  assert.equal((await f.call('bilibili_interact', args)).result.data.duplicate, true);
-  for (let i = 0; i < 2; i++) assert.equal((await f.call('bilibili_interact', { ...args, operationId: 'synthetic-coin-alias' })).result.data.duplicate, true);
-  const stats = await fixture.stats(); assert.equal(stats.submissions.length, 1); assert.equal(stats.submissions[0].coinCount, 2);
+  const callsAfterRenewal = (await fixture.stats()).calls.length;
+  assert.equal((await f.call('bilibili_interact', args)).result.error.code, 'invalid_input');
+  const stats = await fixture.stats(); assert.equal(stats.submissions.length, 0);
+  assert.equal(stats.calls.length, callsAfterRenewal);
   assert.equal(stats.calls.filter((c: string) => c === 'refresh:renew').length, 1); assert.equal(f.requests.length, 0);
   const experiences = (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((r: any) => r.origin?.action === 'coin');
-  assert.equal(experiences.length, 1);
+  assert.equal(experiences.length, 0);
   for (const marker of ['SYNTHETIC_REFRESH_OLD', 'SYNTHETIC_REFRESH_NEXT', 'SYNTHETIC_ROTATED_SESSION']) assert.equal(JSON.stringify(publicState).includes(marker), false);
   const pluginData = await diskText(join(f.bilibili, 'data')); assert.equal(pluginData.includes(RAW_DANMAKU), false);
   await f.assertPrivate([videoRef, 'SYNTHETIC_REFRESH_OLD', 'SYNTHETIC_REFRESH_NEXT', 'SYNTHETIC_ROTATED_SESSION']);

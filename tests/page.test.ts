@@ -68,14 +68,15 @@ test('history synchronization starts off and saves independently of audio and in
   assert.equal(f.saved[1].config.historySyncEnabled, false);
 });
 
-test('danmaku, coin and automatic renewal are three independent default-off controls', async () => {
+test('danmaku and automatic renewal remain independent controls after removing coin settings', async () => {
   const f = await pageFixture(async () => response({ ok: false })); await f.get('refresh').onclick();
-  for (const id of ['danmakuEnabled', 'autoRefreshEnabled', 'coin']) assert.equal(f.get(id).checked, false);
-  for (const id of ['danmakuEnabled', 'autoRefreshEnabled', 'coin']) {
+  assert.equal(f.get('coin'), undefined);
+  for (const id of ['danmakuEnabled', 'autoRefreshEnabled']) assert.equal(f.get(id).checked, false);
+  for (const id of ['danmakuEnabled', 'autoRefreshEnabled']) {
     f.get(id).checked = true; await f.get('settings').onsubmit({ preventDefault() {} });
     const config = f.saved.at(-1).config;
     assert.equal(config.danmakuEnabled, id === 'danmakuEnabled'); assert.equal(config.autoRefreshEnabled, id === 'autoRefreshEnabled');
-    assert.equal(config.interactions.coin, id === 'coin'); assert.equal(config.audioEnabled, false); assert.equal(config.historySyncEnabled, false);
+    assert.equal(Object.hasOwn(config.interactions, 'coin'), false); assert.equal(config.audioEnabled, false); assert.equal(config.historySyncEnabled, false);
     for (const action of ['like', 'favorite', 'follow', 'comment', 'reply']) assert.equal(config.interactions[action], false);
     f.get(id).checked = false; await f.get('settings').onsubmit({ preventDefault() {} });
   }
