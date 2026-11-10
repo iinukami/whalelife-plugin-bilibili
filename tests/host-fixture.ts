@@ -121,7 +121,7 @@ export async function apply(ctx) {
   const video = { bvid: ${JSON.stringify(VIDEO_ID)}, aid: 12345, cid: 67890, copyright: 1,
     title: ${JSON.stringify(RAW_TITLE)}, description: ${JSON.stringify(RAW_DESCRIPTION)},
     owner: { mid: 9988, name: 'Synthetic creator' }, duration: 120,
-    cover: 'https://i0.hdslb.com/bfs/archive/synthetic-cover.jpg', url: ${JSON.stringify(VIDEO_URL)},
+    cover: 'https://synthetic.bili.example/cover.jpg', url: ${JSON.stringify(VIDEO_URL)},
     parts: [{ cid: 67890, page: 1, title: 'Synthetic part', duration: 120 }] };
   const record = (name, options) => { options.signal?.throwIfAborted(); calls.push(name); };
   const rootComment = () => ({aid:12345,rpid:'90071992547409930',root:'0',parent:'0',

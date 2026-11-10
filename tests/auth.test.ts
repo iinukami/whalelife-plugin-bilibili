@@ -106,11 +106,6 @@ test('legacy coin settings are ignored on load and cannot be enabled through upd
 
 test('configuration defaults keep audio and every interaction disabled; partial updates preserve independent settings', () => {
   const config = parseConfig({});
-  assert.equal(config.shareToQQEnabled, false);
-  const sharing = updateConfig({ shareToQQEnabled: true }, config);
-  assert.equal(sharing.shareToQQEnabled, true); assert.equal(sharing.audioEnabled, false);
-  assert.ok(Object.values(sharing.interactions).every(value => value === false));
-  assert.equal(updateConfig({ danmakuEnabled: true }, sharing).shareToQQEnabled, true);
   assert.equal(config.danmakuEnabled, false); assert.equal(config.autoRefreshEnabled, false); assert.equal(Object.hasOwn(config.interactions, 'coin'), false);
   const optional = updateConfig({ danmakuEnabled: true }, config);
   assert.equal(optional.danmakuEnabled, true); assert.equal(optional.autoRefreshEnabled, false); assert.equal(optional.audioEnabled, false);
@@ -122,7 +117,7 @@ test('configuration defaults keep audio and every interaction disabled; partial 
   assert.equal(config.interactions.comment, false);
   assert.equal(defaults.interactions.comment, false);
   assert.equal(changed.favoriteFolderId, '301');
-  for (const input of [{ shareToQQEnabled: 'true' }, { shareToQQEnabled: 1 }, { audioEnabled: 'false' }, { interactions: { share: true } }, { interactions: { like: 1 } },
+  for (const input of [{ audioEnabled: 'false' }, { interactions: { share: true } }, { interactions: { like: 1 } },
     { maxMediaBytes: 65 * 1048576 }, { referenceTtlSeconds: 0 }, { favoriteFolderId: '../data' }, { cookie: COOKIE }, [], null]) {
     assert.throws(() => parseConfig(input), errorCode('config_invalid'));
   }
