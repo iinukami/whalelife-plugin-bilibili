@@ -15,6 +15,14 @@ const messages: Record<string, string> = {
   comment_mismatch: '评论目标与视频或通知不一致，未继续操作。',
   history_disabled: '尚未开启同步 B 站观看历史。',
   danmaku_disabled: '尚未开启读取 B 站弹幕。',
+  qq_unavailable: 'QQ 视频分享服务暂不可用，请检查 QQ 插件版本与连接。',
+  qq_share_disabled: '尚未开启将 B 站视频分享到 QQ。',
+  permission_required: '分享到 QQ 需要当前会话的完全执行权限。',
+  qq_share_error: 'QQ 视频分享未完成，请检查发送回执。',
+  qq_share_invalid_card: 'QQ 返回的视频卡片未通过校验，本次未发送。',
+  qq_recipient_unavailable: '收件人不在 QQ 好友白名单内或为自身账号。',
+  qq_share_conflict: '该分享动作编号已用于其他内容，请核对原回执，不要盲目重发。',
+  qq_share_storage: 'QQ 分享回执读取或保存失败，请核对已有结果，不要重发。',
 };
 export class BiliError extends Error { code: string; constructor(code: string) { super(messages[code] ?? messages.platform_error); this.name = 'BiliError'; this.code = messages[code] ? code : 'platform_error'; } }
 export function safeError(error: unknown) { const e = error instanceof BiliError ? error : new BiliError('network_error'); return { code: e.code, message: e.message }; }
