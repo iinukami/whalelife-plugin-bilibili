@@ -10,6 +10,8 @@ import { readDanmaku } from './danmaku-client.ts';
 import type { DanmakuInput } from './danmaku-client.ts';
 import { checkRefresh, getRefreshCsrf, renewCookies, confirmRefresh, refreshToken } from './refresh-client.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
+import { withDiagnostics } from './diagnostics.ts';
+import type { DiagnosticSink } from './diagnostics.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
   SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
@@ -178,8 +180,8 @@ export class BiliClient implements BiliClientContract {
   private knownImages = new Set<string>();
   private knownSubtitles = new Set<string>();
   private loginKeys = new Map<string, number>();
-  constructor(options: { transport?: Transport; signal?: AbortSignal } = {}) {
-    this.transport = options.transport ?? createTransport();
+  constructor(options: { transport?: Transport; signal?: AbortSignal; onDiagnostic?: DiagnosticSink } = {}) {
+    this.transport = withDiagnostics(options.transport ?? createTransport(), options.onDiagnostic);
     this.signal = options.signal ? AbortSignal.any([options.signal, this.aborter.signal]) : this.aborter.signal;
   }
   private options(options: CallOptions) {

@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.2.0，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.1，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -49,6 +49,10 @@ QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有�
 MP4 下载前先校验主地址；若不通过，只检查同一播放响应中前8个备用地址，选择首个通过相同校验的候选。所有候选仍受标准 HTTPS 端口、公网 DNS 和下载限额约束；开始下载后失败不会自动换地址重试，CDN 请求不附带账号 Cookie。
 
 平台HTTP/JSON数据结构仅在本插件内适配，版本变化以明确错误报告。缺少宿主临时工具时停用浏览，缺少视觉只关闭观看。插件停止撤销入口并取消所属请求；已经确认的远端动作不伪装撤销、不自动重放。
+
+0.2.1 起，默认客户端通过公开 `ctx.logger.warn` 写“B 站请求失败”诊断，每次失败请求至多一条，沿用宿主日志级别与保留设置。字段为随机 `requestId`、固定 `endpoint`、`method`、初始请求携带非空 SESSDATA 的布尔值 `hasSessionCookie`、`elapsedMs`，以及 `stage`：`http` 为非2xx响应（含原 `httpStatus`），`api` 为已知 JSON 接口的非零数字业务码（含 `httpStatus/apiCode`），`transport` 为传输异常（仅固定安全 `errorCode`），`response` 为有界 JSON envelope 格式异常。固定 API 路径白名单可附 `host/path`；CDN、短链、续期动态路径及未知地址均不记录原主机或路径。HTTP 非2xx不扩大响应体读取；JSON观察最多2MiB，不解析媒体或弹幕二进制。二维码等待、已扫码、正常过期均不是失败诊断；`code:0` 后的具体业务data校验不属于本层诊断。
+
+诊断不含查询参数、请求体、响应正文、原始错误说明、异常栈、请求头、Cookie值、用户/视频标识或会话ID，不进入模型回执或经历。排查时按时间和接口对应宿主工具记录；请求编号只标识一条诊断，不作为跨系统追踪ID。携带Cookie不证明登录有效，错误码不证明平台内部风控策略。日志写入失败不改变原响应或异常、取消行为及POST是否已提交的判断；不新增请求、重试、后台监听或风控绕过。
 
 `danmakuEnabled`、`autoRefreshEnabled` 均默认false，旧配置缺字段按false迁移。弹幕仅经safe临时工具返回文字、精确字符串id与视频秒数；时间窗为[from,to)，获取必要的6分钟分段，每段限2MiB/12000条，只保留模式1–6，最多返回12000条，每页100条，每条最多500字。truncated表明裁切，excludedModes统计窗口内未返回的特殊模式；不暴露发送者哈希，不执行代码弹幕，不能视为全量历史。无需vision/声音，不自动记历史。
 

@@ -12,8 +12,9 @@ import { BiliError, object, safeError } from './errors.ts';
 import { BiliRuntime } from './runtime.ts';
 import { settingsPage } from './page.ts';
 import type { BiliClientContract, Config, QQVideoShareService, SurfService, VisionService } from './types.ts';
+import type { Transport } from './transport.ts';
 
-export interface Dependencies { client?: BiliClientContract; now?: () => number }
+export interface Dependencies { client?: BiliClientContract; transport?: Transport; now?: () => number }
 export async function apply(ctx: Context) { return applyWithDependencies(ctx); }
 const shape = (properties: Record<string, unknown>, required: string[] = []) => ({ type: 'object', properties, required, additionalProperties: false });
 const text = { type: 'string' }, page = { type: 'integer', minimum: 1, maximum: 100 };
@@ -21,7 +22,8 @@ const text = { type: 'string' }, page = { type: 'integer', minimum: 1, maximum: 
 export async function applyWithDependencies(ctx: Context, dependencies: Dependencies = {}) {
   let config: Config = structuredClone(defaults), configValid = true;
   try { config = parseConfig(await ctx.config.read()); } catch { configValid = false; }
-  const client = dependencies.client ?? new BiliClient({ signal: ctx.signal });
+  const client = dependencies.client ?? new BiliClient({ signal: ctx.signal, transport: dependencies.transport,
+    onDiagnostic: event => ctx.logger.warn('B 站请求失败', event) });
   const auth = new AuthManager(client, { read: () => ctx.config.read('account.json'), save: value => ctx.config.save('account.json', value) }, ctx.signal, 20000, dependencies.now);
   auth.configureRefresh(config.autoRefreshEnabled);
   const surf = ctx.get<SurfService>('surf');

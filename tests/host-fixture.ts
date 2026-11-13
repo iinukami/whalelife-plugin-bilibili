@@ -12,6 +12,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { temporaryDirectory, root } from './temporary-directory.ts';
 
 export const CURRENT_HOST = '38af5e72e466dd6da7f390e445cd1e6cc2f02a69';
+export const DIAGNOSTICS_HOST = '355af1a0ca0330ee4f826efd73cbc396e997dda8';
 export const MINIMUM_HOST = 'refs/tags/213b52b';
 const MINIMUM_HOST_COMMIT = '7c8e3898b2bc7cb0b892eb0ab2feec0ca9c8aaf0';
 export const RAW_TITLE = 'SYNTHETIC_BILI_FOREIGN_TITLE_DO_NOT_PERSIST';
@@ -59,7 +60,8 @@ export async function hostFixture(t: TestContext, baseline = CURRENT_HOST) {
   const revision = spawnSync('git', [...gitArgs, 'rev-parse', '--verify', baseline + '^{commit}'],
     { encoding: 'utf8', windowsHide: true, timeout: 15000 });
   assert.equal(revision.status, 0, revision.stderr || revision.error?.message);
-  assert.equal(revision.stdout.trim(), baseline === MINIMUM_HOST ? MINIMUM_HOST_COMMIT : CURRENT_HOST,
+  assert.ok([MINIMUM_HOST, CURRENT_HOST, DIAGNOSTICS_HOST].includes(baseline), 'use an explicitly frozen host baseline');
+  assert.equal(revision.stdout.trim(), baseline === MINIMUM_HOST ? MINIMUM_HOST_COMMIT : baseline,
     'a frozen host baseline must not silently move');
   const archived = spawnSync('git', [...gitArgs, 'archive', '--format=tar', '--output=' + archive, revision.stdout.trim(), 'core', 'package.json'],
     { encoding: 'utf8', windowsHide: true, timeout: 15000 });
