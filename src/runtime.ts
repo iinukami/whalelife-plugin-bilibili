@@ -234,7 +234,8 @@ export class BiliRuntime {
         if (action === 'browse' || action === 'search') {
           const page = integer(args.page, 1);
           let result;
-          if (action === 'search') result = await this.client.search(string(args.query, 200), page, options);
+          if (action === 'search') result = await this.client.search(string(args.query, 200), page,
+            { ...options, assertCurrent: () => this.checkOperation(identity, options) });
           else {
             if (args.source !== 'recommended' && args.source !== 'following') throw new BiliError('invalid_input');
             const cursor = args.cursor === undefined ? undefined : string(args.cursor, 200);

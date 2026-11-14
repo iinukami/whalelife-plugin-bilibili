@@ -6,7 +6,11 @@ import type { HistoryTarget, HistoryPositionInput, HistoryProgress } from './his
 import type { DanmakuInput, DanmakuResult } from './danmaku-client.ts';
 export type Action = 'like' | 'favorite' | 'follow' | 'comment' | 'reply';
 export interface Config { audioEnabled: boolean; historySyncEnabled: boolean; danmakuEnabled: boolean; autoRefreshEnabled: boolean; shareToQQEnabled: boolean; interactions: Record<Action, boolean>; favoriteFolderId: string; maxMediaBytes: number; referenceTtlSeconds: number }
-export interface CallOptions { signal?: AbortSignal; cookie?: string; timeoutMs?: number }
+export interface CallOptions {
+  signal?: AbortSignal; cookie?: string; timeoutMs?: number;
+  /** Internal search-stage guard; never part of platform request data. */
+  assertCurrent?: () => void;
+}
 export interface VideoItem { bvid: string; aid: number; title: string; owner: { mid: number; name: string }; duration: number; cover: string; url: string }
 export interface VideoDetails extends VideoItem { cid: number; description: string; copyright?: 1 | 2 | 3; parts: { cid: number; page: number; title: string; duration: number }[] }
 export interface VideoList { items: VideoItem[]; hasMore: boolean; cursor?: string; nextPage?: number }

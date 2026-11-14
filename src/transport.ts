@@ -13,6 +13,8 @@ import { BiliError } from './errors.ts';
 export interface TransportOptions {
   method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string;
   signal?: AbortSignal; timeoutMs: number; maxBytes: number;
+  // Observer-only context; never sent as an HTTP header or query parameter.
+  diagnosticPurpose?: 'search_keys';
 }
 export interface TransportResponse { status: number; headers: Record<string, string | string[]>; body: Buffer; url: string }
 export interface Transport { request(url: string, options: TransportOptions): Promise<TransportResponse>; dispose(): void | Promise<void> }

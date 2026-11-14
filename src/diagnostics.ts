@@ -4,6 +4,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { BiliError } from './errors.ts';
+import { readWbiKeys } from './wbi.ts';
 import type { Transport, TransportOptions, TransportResponse } from './transport.ts';
 
 export interface RequestDiagnostic {
@@ -26,6 +27,8 @@ const apiPaths: Readonly<Record<string, string>> = Object.freeze({
   '/x/web-interface/wbi/index/top/feed/rcmd': 'recommended',
   '/x/polymer/web-dynamic/v1/feed/all': 'following',
   '/x/web-interface/search/type': 'search',
+  '/x/web-interface/wbi/search/type': 'search',
+  '/x/web-frontend/getbuvid': 'search_cookie',
   '/x/web-interface/view': 'video',
   '/x/v2/reply': 'comments',
   '/x/v2/reply/detail': 'comment_detail',
@@ -54,13 +57,13 @@ const transportCodes = new Set(['invalid_input', 'network_error', 'timeout', 'ca
   'login_required', 'platform_error', 'unsupported_media', 'too_large', 'unsafe_url', 'malformed_response', 'uncertain']);
 const jsonLimit = 2 * 1024 * 1024;
 const ordinaryPollCodes = new Set([0, 86101, 86090, 86038]);
-type RequestContext = Pick<RequestDiagnostic, 'endpoint' | 'host' | 'path' | 'method' | 'hasSessionCookie'> & { json: boolean };
+type RequestContext = Pick<RequestDiagnostic, 'endpoint' | 'host' | 'path' | 'method' | 'hasSessionCookie'> & { json: boolean; searchKeys: boolean };
 type Failure = Pick<RequestDiagnostic, 'stage' | 'httpStatus' | 'apiCode' | 'errorCode'>;
 
 function context(input: string, options: TransportOptions): RequestContext {
   let cookie = '';
   for (const [key, value] of Object.entries(options.headers ?? {})) if (key.toLowerCase() === 'cookie') cookie = value;
-  const base: RequestContext = { endpoint: 'unknown', json: false,
+  const base: RequestContext = { endpoint: 'unknown', json: false, searchKeys: false,
     method: options.method === undefined || options.method === 'GET' ? 'GET' : options.method === 'POST' ? 'POST' : 'unknown',
     hasSessionCookie: typeof cookie === 'string' && /(?:^|;\s*)SESSDATA=[^;\s]+/.test(cookie) };
   let url: URL;
@@ -68,7 +71,9 @@ function context(input: string, options: TransportOptions): RequestContext {
   const host = url.hostname, path = url.pathname;
   const routes = host === 'api.bilibili.com' ? apiPaths : host === 'passport.bilibili.com' ? passportPaths : undefined;
   if (routes && Object.hasOwn(routes, path)) return { ...base, endpoint: routes[path],
-    host: host as RequestDiagnostic['host'], path, json: true };
+    host: host as RequestDiagnostic['host'], path, json: true,
+    searchKeys: host === 'api.bilibili.com' && path === '/x/web-interface/nav'
+      && options.diagnosticPurpose === 'search_keys' && !base.hasSessionCookie };
   if (host === 'api.bilibili.com' && path === '/x/v2/dm/web/seg.so') return { ...base, endpoint: 'danmaku' };
   if (host === 'www.bilibili.com' && path.startsWith('/correspond/1/')) return { ...base, endpoint: 'refresh_csrf' };
   if (host === 'b23.tv') return { ...base, endpoint: 'short_link' };
@@ -91,7 +96,20 @@ function observe(response: TransportResponse, request: RequestContext): Failure 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response' };
   const code = (value as { code?: unknown }).code;
   if (!Number.isSafeInteger(code)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response' };
-  if (code !== 0) return { stage: 'api', httpStatus: status, apiCode: code as number };
+  if (code !== 0) {
+    if (code === -101 && request.searchKeys) {
+      try {
+        const data = (value as { data?: { isLogin?: unknown; wbi_img?: unknown } }).data;
+        if (data?.isLogin === false) { readWbiKeys(data.wbi_img); return; }
+      } catch { /* An invalid anonymous envelope remains a failure diagnostic. */ }
+    }
+    return { stage: 'api', httpStatus: status, apiCode: code as number };
+  }
+  if (request.endpoint === 'search') {
+    const data = (value as { data?: unknown }).data;
+    if (data && typeof data === 'object' && !Array.isArray(data) && Object.hasOwn(data, 'v_voucher'))
+      return { stage: 'response', httpStatus: status, errorCode: 'access_blocked' };
+  }
   if (request.endpoint === 'login_poll') {
     const data = (value as { data?: unknown }).data;
     const pollCode = data && typeof data === 'object' && !Array.isArray(data) ? (data as { code?: unknown }).code : undefined;
@@ -112,7 +130,7 @@ export function withDiagnostics(transport: Transport, sink?: DiagnosticSink): Tr
         if (reported || !request) return;
         reported = true;
         try {
-          const { json: _json, ...fields } = request;
+          const { json: _json, searchKeys: _searchKeys, ...fields } = request;
           const elapsedMs = Math.max(0, Math.round(performance.now() - started));
           const event: RequestDiagnostic = { requestId: randomUUID(), ...fields, elapsedMs, ...failure };
           // Do not await logging or let synchronous/asynchronous sink failures enter the business path.

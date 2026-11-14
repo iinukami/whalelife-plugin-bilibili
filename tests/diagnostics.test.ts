@@ -143,3 +143,37 @@ test('request ids are random per failure and session-cookie reporting is boolean
   assert.deepEqual(f.events.map(event => event.hasSessionCookie), [true, false, false, false]);
   assert.equal(new Set(f.events.map(event => event.requestId)).size, 4); privateSafe(f.events);
 });
+
+test('new search routes preserve fixed diagnostics and validation vouchers never expose their value', async () => {
+  for (const path of ['/x/web-interface/search/type', '/x/web-interface/wbi/search/type']) {
+    const f = fixture(response({ code: 0, data: { v_voucher: 'SECRET_VOUCHER' } }));
+    await f.transport.request('https://api.bilibili.com' + path + '?keyword=SECRET_QUERY&w_rid=SECRET_SIGNATURE', options);
+    assert.equal(f.events.length, 1);
+    assert.equal(f.events[0].endpoint, 'search'); assert.equal(f.events[0].path, path);
+    assert.equal(f.events[0].stage, 'response'); assert.equal(f.events[0].httpStatus, 200);
+    assert.equal(f.events[0].errorCode, 'access_blocked'); assert.equal(f.events[0].apiCode, undefined);
+    privateSafe(f.events);
+  }
+  const f = fixture(response({}, 412));
+  await f.transport.request('https://api.bilibili.com/x/web-frontend/getbuvid', options);
+  assert.equal(f.events[0].endpoint, 'search_cookie'); assert.equal(f.events[0].httpStatus, 412); privateSafe(f.events);
+});
+
+test('only anonymous nav explicitly used for valid search keys suppresses the expected -101 diagnostic', async () => {
+  const nav = 'https://api.bilibili.com/x/web-interface/nav';
+  const data = { isLogin: false, wbi_img: {
+    img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
+    sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } };
+  const normal = fixture(response({ code: -101, data }));
+  await normal.transport.request(nav, { ...options, headers: {}, diagnosticPurpose: 'search_keys' });
+  assert.equal(normal.events.length, 0);
+  for (const [input, settings, envelope] of [
+    [nav, { ...options, headers: {} }, { code: -101, data }],
+    [nav, { ...options, diagnosticPurpose: 'search_keys' }, { code: -101, data }],
+    [nav, { ...options, headers: {}, diagnosticPurpose: 'search_keys' }, { code: -101, data: { isLogin: false, wbi_img: {} } }],
+    [search, { ...options, headers: {}, diagnosticPurpose: 'search_keys' }, { code: -101, data }],
+  ] as [string, TransportOptions, unknown][]) {
+    const f = fixture(response(envelope)); await f.transport.request(input, settings);
+    assert.equal(f.events.length, 1); assert.equal(f.events[0].apiCode, -101); privateSafe(f.events);
+  }
+});

@@ -18,7 +18,16 @@ function fixture() {
   let disposed = false;
   const client = new BiliClient({ transport: {
     async request(url, options) {
-      calls.push({ url, options }); const next = queue.shift(); assert.ok(next, 'missing synthetic response');
+      calls.push({ url, options });
+      const path = new URL(url).pathname;
+      // Preparation has dedicated protocol tests; these cases focus on normalizing result data.
+      if (path === '/x/web-frontend/getbuvid') return { status: 200, headers: {}, url,
+        body: Buffer.from(JSON.stringify({ code: 0, data: { buvid: 'SYNTHETIC_SEARCH_DEVICE' } })) };
+      if (path === '/x/web-interface/nav' && options.diagnosticPurpose === 'search_keys') return { status: 200, headers: {}, url,
+        body: Buffer.from(JSON.stringify({ code: 0, data: { wbi_img: {
+          img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
+          sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } } })) };
+      const next = queue.shift(); assert.ok(next, 'missing synthetic response');
       if (next instanceof Error) throw next;
       return { status: 200, headers: {}, body: Buffer.from('{}'), url, ...next };
     }, dispose() { disposed = true; },
@@ -51,7 +60,7 @@ test('recommendation and search normalize ordinary videos without confusing ads 
   f.json({ result: [{ ...item, type: 'video', duration: '12:34', mid: 123, author: '测试作者', owner: undefined }, { ...item, type: 'live' }], numPages: 3 });
   const search = await f.client.search('合成问题', 2, {});
   assert.equal(search.items[0].duration, 754); assert.equal(search.items.length, 1); assert.equal(search.nextPage, 3);
-  assert.equal(new URL(f.calls[1].url).searchParams.get('keyword'), '合成问题');
+  assert.equal(new URL(f.calls.find(call => new URL(call.url).pathname === '/x/web-interface/wbi/search/type')!.url).searchParams.get('keyword'), '合成问题');
 });
 
 test('following requires login, reads archive/author modules and preserves opaque pagination', async () => {

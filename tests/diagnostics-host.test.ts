@@ -16,17 +16,23 @@ for (const baseline of [DIAGNOSTICS_HOST, MINIMUM_HOST]) {
     await f.plugin('surf/bilibili', `
 import { applyWithDependencies } from ${JSON.stringify(pathToFileURL(join(root, 'src/index.ts')).href)};
 export async function apply(ctx) {
-  let accountCalls = 0, searchCalls = 0;
-  ctx.provide('diagnostic-fixture', { counts: () => ({ accountCalls, searchCalls }) });
+  let accountCalls = 0, searchCalls = 0, searchKeyCalls = 0, searchCookieCalls = 0;
+  ctx.provide('diagnostic-fixture', { counts: () => ({ accountCalls, searchCalls, searchKeyCalls, searchCookieCalls }) });
   return applyWithDependencies(ctx, { transport: {
     async request(url, options) {
       const path = new URL(url).pathname;
       let status = 200, body;
-      if (path === '/x/web-interface/nav') {
+      if (path === '/x/web-frontend/getbuvid') {
+        searchCookieCalls++; body = { code: 0, data: { buvid: 'SYNTHETIC_SEARCH_DEVICE' } };
+      } else if (path === '/x/web-interface/nav' && options.diagnosticPurpose === 'search_keys') {
+        searchKeyCalls++; body = { code: 0, data: { wbi_img: {
+          img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
+          sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } } };
+      } else if (path === '/x/web-interface/nav') {
         accountCalls++;
         body = accountCalls === 1 ? { code: -352, message: ${JSON.stringify(ERROR_SECRET)} }
           : { code: 0, data: { isLogin: true, mid: 4321, uname: 'SYNTHETIC_PRIVATE_ACCOUNT_NAME' } };
-      } else if (path === '/x/web-interface/search/type') {
+      } else if (path === '/x/web-interface/wbi/search/type') {
         searchCalls++;
         status = searchCalls === 1 ? 412 : 200;
         body = searchCalls === 2 ? { code: -401, message: ${JSON.stringify(ERROR_SECRET)} }
@@ -62,12 +68,13 @@ export async function apply(ctx) {
       assert.equal(http.stage, 'http'); assert.equal(http.httpStatus, 412); assert.equal(http.apiCode, undefined);
       assert.equal(api.stage, 'api'); assert.equal(api.httpStatus, 200); assert.equal(api.apiCode, -401);
       for (const entry of [http, api]) {
-        assert.equal(entry.endpoint, 'search'); assert.equal(entry.path, '/x/web-interface/search/type');
+        assert.equal(entry.endpoint, 'search'); assert.equal(entry.path, '/x/web-interface/wbi/search/type');
         assert.equal(entry.host, 'api.bilibili.com'); assert.equal(entry.method, 'GET');
         assert.equal(entry.hasSessionCookie, true);
       }
     } else assert.equal(f.names().includes('bilibili_search'), false, 'minimum host capability must remain unchanged');
-    assert.deepEqual(await f.service('diagnostic-fixture').counts(), { accountCalls: 2, searchCalls: baseline === DIAGNOSTICS_HOST ? 3 : 0 });
+    assert.deepEqual(await f.service('diagnostic-fixture').counts(), { accountCalls: 2, searchCalls: baseline === DIAGNOSTICS_HOST ? 3 : 0,
+      searchKeyCalls: baseline === DIAGNOSTICS_HOST ? 1 : 0, searchCookieCalls: baseline === DIAGNOSTICS_HOST ? 1 : 0 });
     await f.assertPrivate(['SYNTHETIC_PRIVATE_ACCOUNT_NAME']);
     const persisted = await diskText(join(f.run, 'logs'));
     for (const entry of diagnostics()) {

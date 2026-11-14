@@ -11,6 +11,7 @@ import type { DanmakuInput } from './danmaku-client.ts';
 import { checkRefresh, getRefreshCsrf, renewCookies, confirmRefresh, refreshToken } from './refresh-client.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
 import { withDiagnostics } from './diagnostics.ts';
+import { readWbiKeys, signWbi, type WbiKeys } from './wbi.ts';
 import type { DiagnosticSink } from './diagnostics.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
@@ -173,6 +174,14 @@ function apiData(response: TransportResponse): Record<string, any> {
   return json.data == null ? {} : record(json.data);
 }
 
+interface SearchPreparation {
+  identity: string;
+  buvid?: string;
+  keys?: { value: WbiKeys; expires: number };
+  pending: Promise<void>;
+  failure?: { error: unknown };
+}
+
 export class BiliClient implements BiliClientContract {
   private transport: Transport;
   private aborter = new AbortController();
@@ -180,6 +189,7 @@ export class BiliClient implements BiliClientContract {
   private knownImages = new Set<string>();
   private knownSubtitles = new Set<string>();
   private loginKeys = new Map<string, number>();
+  private searchPreparation?: SearchPreparation;
   constructor(options: { transport?: Transport; signal?: AbortSignal; onDiagnostic?: DiagnosticSink } = {}) {
     this.transport = withDiagnostics(options.transport ?? createTransport(), options.onDiagnostic);
     this.signal = options.signal ? AbortSignal.any([options.signal, this.aborter.signal]) : this.aborter.signal;
@@ -187,6 +197,7 @@ export class BiliClient implements BiliClientContract {
   private options(options: CallOptions) {
     if (this.signal.aborted) throw new BiliError('stopped');
     if (options.signal?.aborted) throw new BiliError('cancelled');
+    options.assertCurrent?.();
     const timeoutMs = options.timeoutMs ?? 20000;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 240000) throw new BiliError('invalid_input');
     return { signal: AbortSignal.any([this.signal, ...(options.signal ? [options.signal] : [])]), timeoutMs };
@@ -202,13 +213,70 @@ export class BiliClient implements BiliClientContract {
   refreshCsrf(timestamp: number, options: CallOptions) { return getRefreshCsrf(this.transport, timestamp, { ...options, ...this.options(options) }); }
   renewCookies(token: string, csrf: string, options: CallOptions) { return renewCookies(this.transport, token, csrf, { ...options, ...this.options(options) }); }
   confirmRefresh(token: string, options: CallOptions) { return confirmRefresh(this.transport, token, { ...options, ...this.options(options) }); }
-  private async request(path: string, params: Record<string, string>, options: CallOptions, passport = false) {
-    const url = new URL(path, passport ? PASSPORT : API); url.search = new URLSearchParams(params).toString();
+  private async request(path: string, params: Record<string, string> | string, options: CallOptions, passport = false, diagnosticPurpose?: 'search_keys') {
+    const url = new URL(path, passport ? PASSPORT : API);
+    url.search = typeof params === 'string' ? params : new URLSearchParams(params).toString();
     const cookie = checkedCookie(options.cookie);
-    const response = await this.transport.request(url.href, { ...this.options(options), maxBytes: 2 * 1024 * 1024,
+    const response = await this.transport.request(url.href, { ...this.options(options), maxBytes: 2 * 1024 * 1024, ...(diagnosticPurpose ? { diagnosticPurpose } : {}),
       headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate, br', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/', ...(cookie ? { Cookie: cookie } : {}) } });
     if (safeUrl(response.url).hostname !== url.hostname) throw new BiliError('unsafe_url');
     return response;
+  }
+  private async waitSearchPreparation(pending: Promise<void>, options: CallOptions): Promise<void> {
+    const { signal } = this.options(options);
+    await new Promise<void>((resolve, reject) => {
+      const cancelled = () => { cleanup(); reject(new BiliError(this.signal.aborted ? 'stopped' : 'cancelled')); };
+      const cleanup = () => signal.removeEventListener('abort', cancelled);
+      signal.addEventListener('abort', cancelled, { once: true });
+      if (signal.aborted) { cancelled(); return; }
+      pending.then(() => { cleanup(); resolve(); }, error => { cleanup(); reject(error); });
+    });
+    this.options(options);
+  }
+  private async prepareSearch(options: CallOptions): Promise<{ cookie: string; keys: WbiKeys }> {
+    this.options(options);
+    const identity = checkedCookie(options.cookie);
+    let state = this.searchPreparation;
+    if (!state || state.identity !== identity) {
+      state = { identity, pending: Promise.resolve() };
+      this.searchPreparation = state;
+    }
+    // Serialize preparation only. A cancelled waiter never cancels another caller's work.
+    const preceding = state.pending, observedFailure = state.failure;
+    let attempting = false;
+    let release!: () => void;
+    const ticket = new Promise<void>(resolve => { release = resolve; });
+    state.pending = preceding.then(() => ticket);
+    try {
+      await this.waitSearchPreparation(preceding, options);
+      if (state.failure && state.failure !== observedFailure) throw state.failure.error;
+      attempting = true;
+      let cookie = identity;
+      if (!cookieValue(cookie, 'buvid3')) {
+        if (!state.buvid) {
+          const issued = apiData(await this.request('/x/web-frontend/getbuvid', {}, options));
+          this.options(options);
+          if (typeof issued.buvid !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(issued.buvid)) throw new BiliError('malformed_response');
+          state.buvid = issued.buvid;
+        }
+        cookie += (cookie ? '; ' : '') + 'buvid3=' + state.buvid;
+      }
+      if (!state.keys || state.keys.expires <= Date.now()) {
+        const response = await this.request('/x/web-interface/nav', {}, { ...options, cookie }, false, 'search_keys');
+        this.options(options);
+        const json = parseJson(response);
+        // Public search can use the keys in an anonymous nav response without claiming login.
+        const data = json.code === -101 && !cookieValue(cookie, 'SESSDATA') ? record(json.data) : apiData(response);
+        const value = readWbiKeys(data.wbi_img);
+        state.keys = { value, expires: Date.now() + 5 * 60 * 1000 };
+      }
+      this.options(options);
+      state.failure = undefined;
+      return { cookie, keys: state.keys.value };
+    } catch (error) {
+      if (attempting && !(error instanceof BiliError && ['cancelled', 'stopped', 'account_changed'].includes(error.code))) state.failure = { error };
+      throw error;
+    } finally { release(); }
   }
   private remember(set: Set<string>, value: string) { if (set.size >= 1024) set.delete(set.values().next().value!); set.add(value); }
   private item(raw: unknown, author?: unknown): VideoItem | undefined {
@@ -251,7 +319,12 @@ export class BiliClient implements BiliClientContract {
   async search(query: string, page: number, options: CallOptions): Promise<VideoList> {
     pageNumber(page);
     if (typeof query !== 'string' || !query.trim() || query.length > 300 || /[\x00-\x1f\x7f]/.test(query)) throw new BiliError('invalid_input');
-    const data = apiData(await this.request('/x/web-interface/search/type', { search_type: 'video', keyword: query.trim(), page: String(page), page_size: '12' }, options));
+    try { encodeURIComponent(query); } catch { throw new BiliError('invalid_input'); }
+    const prepared = await this.prepareSearch(options);
+    const params = signWbi({ search_type: 'video', keyword: query.trim(), page: String(page), page_size: '12' }, prepared.keys);
+    const data = apiData(await this.request('/x/web-interface/wbi/search/type', params, { ...options, cookie: prepared.cookie }));
+    this.options(options);
+    if (Object.hasOwn(data, 'v_voucher')) throw new BiliError('access_blocked');
     if (!Array.isArray(data.result)) throw new BiliError('malformed_response');
     let candidates = 0;
     const items = data.result.slice(0, 100).flatMap(raw => {
@@ -492,5 +565,5 @@ export class BiliClient implements BiliClientContract {
     }
     return { state: 'confirmed' };
   }
-  async dispose() { this.aborter.abort(); this.knownImages.clear(); this.knownSubtitles.clear(); this.loginKeys.clear(); await this.transport.dispose(); }
+  async dispose() { this.aborter.abort(); this.searchPreparation = undefined; this.knownImages.clear(); this.knownSubtitles.clear(); this.loginKeys.clear(); await this.transport.dispose(); }
 }
