@@ -16,6 +16,7 @@ export const DIAGNOSTICS_HOST = '355af1a0ca0330ee4f826efd73cbc396e997dda8';
 export const HISTORY_HOST = '9b2cdb7e3e40be2afca931ea7f82e49770b98285';
 export const MINIMUM_HOST = 'refs/tags/213b52b';
 const MINIMUM_HOST_COMMIT = '7c8e3898b2bc7cb0b892eb0ab2feec0ca9c8aaf0';
+export const RAW_OWNER_NAME = 'SYNTHETIC_OWNER_DISPLAY_DO_NOT_PERSIST';
 export const RAW_TITLE = 'SYNTHETIC_BILI_FOREIGN_TITLE_DO_NOT_PERSIST';
 export const RAW_DESCRIPTION = 'SYNTHETIC_BILI_FOREIGN_DESCRIPTION_DO_NOT_PERSIST';
 export const RAW_COMMENT = 'SYNTHETIC_BILI_FOREIGN_COMMENT_DO_NOT_PERSIST';
@@ -120,7 +121,7 @@ import { applyWithDependencies } from ${JSON.stringify(pathToFileURL(join(root, 
 import { BiliError } from ${JSON.stringify(pathToFileURL(join(root, 'src/errors.ts')).href)};
 export async function apply(ctx) {
   let now = Date.now(), calls = [], waiting = false, cancelled = 0, disposed = false, scenario = 'normal', resume;
-  const submissions = [], historyPosts = []; let historyProgress = {found:false};
+  const submissions = [], historyPosts = [], ownerSubmissions = []; let historyProgress = {found:false};
   const video = { bvid: ${JSON.stringify(VIDEO_ID)}, aid: 12345, cid: 67890, copyright: 1,
     title: ${JSON.stringify(RAW_TITLE)}, description: ${JSON.stringify(RAW_DESCRIPTION)},
     owner: { mid: 9988, name: 'Synthetic creator' }, duration: 120,
@@ -132,6 +133,7 @@ export async function apply(ctx) {
   const replyComment = () => ({aid:12345,rpid:'90071992547409931',root:'90071992547409930',parent:'90071992547409930',
     text:${JSON.stringify(RAW_THREAD_REPLY)},author:{mid:1122,name:'Synthetic reply author'},likes:1});
   const client = {
+    async ownerProfile(uid, options) { record('ownerProfile', options); return {uid,name:${JSON.stringify(RAW_OWNER_NAME)}}; },
     async feed(source, page, cursor, options) { record('feed:' + source, options);
       if (source === 'following' && !options.cookie) throw new BiliError('login_required');
       return { items: [video], hasMore: true, nextPage: page + 1, cursor: 'synthetic-next' }; },
@@ -212,11 +214,12 @@ export async function apply(ctx) {
     async pollLogin(key, options) { record('pollLogin', options); return {state:'waiting'}; },
     async folders(mid, options) { record('folders', options); return [{id:'7',title:'Synthetic folder'}]; },
     async interact(input, options) { record('interact', options);
+      if(input.mentionOwner) ownerSubmissions.push({action:input.action,text:input.text,mentionOwner:{...input.mentionOwner}});
       submissions.push({action:input.action,aid:input.aid,mid:input.mid,root:input.root,parent:input.parent});
       return {state:'confirmed',platformId:'123456789'}; },
     dispose() { disposed = true; }
   };
-  ctx.provide('bilibili-test-fixture', {stats:()=>({calls,submissions,historyPosts,waiting,cancelled,disposed,pid:process.pid}),
+  ctx.provide('bilibili-test-fixture', {stats:()=>({calls,submissions,historyPosts,ownerSubmissions,waiting,cancelled,disposed,pid:process.pid}),
     advance:milliseconds=>{now+=milliseconds;},configure:value=>{scenario=value;},resume:()=>{resume?.();resume=undefined;}});
   return applyWithDependencies(ctx, {client, now:()=>now});
 }`);

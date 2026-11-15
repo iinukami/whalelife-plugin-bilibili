@@ -31,8 +31,10 @@ export interface SubtitleTrack { id: string; language: string; label: string; ur
 export interface SubtitleCue { from: number; to: number; text: string }
 export interface Media { bytes: Buffer; mime: string }
 export type LoginPoll = { state: 'waiting' | 'scanned' | 'expired' } | { state: 'confirmed'; cookie: string; refreshToken?: string };
-export interface InteractionInput { action: Action; aid: number; mid: number; enabled?: boolean; folderId?: string; text?: string; root?: string; parent?: string }
+export interface OwnerProfile { uid: string; name: string }
+export interface InteractionInput { mentionOwner?: OwnerProfile; action: Action; aid: number; mid: number; enabled?: boolean; folderId?: string; text?: string; root?: string; parent?: string }
 export interface BiliClientContract {
+  ownerProfile(uid: string, options: CallOptions): Promise<OwnerProfile>;
   feed(source: 'recommended' | 'following', page: number, cursor: string | undefined, options: CallOptions): Promise<VideoList>;
   search(query: string, page: number, options: CallOptions): Promise<VideoList>;
   video(target: string, options: CallOptions): Promise<VideoDetails>;

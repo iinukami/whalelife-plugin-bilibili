@@ -14,7 +14,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 function response(data: unknown, ok = true) { return { ok, json: async () => data }; }
-async function pageFixture(start: () => Promise<ReturnType<typeof response>>, poll?: () => Promise<ReturnType<typeof response>>) {
+async function pageFixture(start: () => Promise<ReturnType<typeof response>>, poll?: () => Promise<ReturnType<typeof response>>, ownerWrite?: () => Promise<void>) {
   const elements = new Map<string, any>();
   for (const [, id] of settingsPage.matchAll(/\bid="([^"]+)"/g)) {
     elements.set(id, { textContent: '', value: '', disabled: false, hidden: id === 'qrBox', checked: false,
@@ -28,6 +28,7 @@ async function pageFixture(start: () => Promise<ReturnType<typeof response>>, po
   let config = { audioEnabled: false, historySyncEnabled: false, interactions: { like: false, favorite: false, follow: false, comment: false, reply: false },
     maxMediaBytes: 67108864, referenceTtlSeconds: 600, favoriteFolderId: '' };
   const saved: any[] = [];
+  const ownerSaves: any[] = [];let owner: any=null,ownerRevision='synthetic-owner-0',ownerCount=0;
   const script = /<script>([\s\S]*?)<\/script>/.exec(settingsPage)?.[1];
   assert.ok(script);
   await runInNewContext(script, {
@@ -41,13 +42,17 @@ async function pageFixture(start: () => Promise<ReturnType<typeof response>>, po
         if (init?.method === 'POST') { const payload = JSON.parse(init.body!); saved.push(payload); config = payload.config; }
         return response({ ok: true, revision: 'synthetic-config', config });
       }
+      if (url.endsWith('/owner')) {
+        if (init?.method === 'POST') { const payload=JSON.parse(init.body!);ownerSaves.push(payload);await ownerWrite?.();if(payload.revision!==ownerRevision)return response({ok:false,error:{message:'配置冲突'}},false);if(payload.uid==='999')return response({ok:false,error:{message:'合成资料获取失败'}},false);owner=payload.uid?{uid:payload.uid,name:'SYNTHETIC_OWNER <img>'}:null;ownerRevision='synthetic-owner-'+(++ownerCount); }
+        return response({ok:true,owner,revision:ownerRevision,invalidStoredState:false});
+      }
       if (url.endsWith('/state')) return response({ ok: true, account: { loggedIn: false, revision: 'synthetic-account' }, status: { ready: true, vision: true } });
       if (url.endsWith('/login/start')) return start();
       if (url.endsWith('/login/poll') && poll) return poll();
       throw Error('Unexpected page request');
     },
   });
-  return { get: (id: string) => elements.get(id), events, timers, saved,
+  return { get: (id: string) => elements.get(id), events, timers, saved, ownerSaves,
     async pollOnce() { const entry = timers.entries().next().value; assert.ok(entry); timers.delete(entry[0]); await entry[1](); } };
 }
 
@@ -143,4 +148,32 @@ test('leaving the page while generating a QR does not revive it or start polling
   assert.equal(f.get('qr').src, undefined);
   assert.equal(f.get('loginMessage').textContent, '');
   assert.equal(f.timers.size, 0);
+});
+
+test('owner settings query and persist separately, render public names as text and retain saved owner on failure', async () => {
+  const f=await pageFixture(async()=>response({ok:false}));await f.get('refresh').onclick();
+  assert.equal(f.get('saveOwner').disabled,false);assert.equal(f.get('clearOwner').disabled,true);
+  f.get('ownerUid').value=' 12345 ';await f.get('ownerForm').onsubmit({preventDefault(){}});
+  assert.equal(f.ownerSaves[0].uid,'12345');assert.equal(f.saved.length,0);
+  assert.equal(f.get('ownerInfo').textContent,'已记住：SYNTHETIC_OWNER <img>（UID 12345）');
+  assert.equal(f.get('ownerInfo').innerHTML,undefined);assert.equal(f.get('ownerLink').href,'https://space.bilibili.com/12345');
+  f.get('ownerUid').value='999';await f.get('ownerForm').onsubmit({preventDefault(){}});
+  assert.match(f.get('ownerInfo').textContent,/未取得保存确认：合成资料获取失败/);
+  await f.get('refresh').onclick();assert.equal(f.get('ownerUid').value,'12345');
+  await f.get('clearOwner').onclick();assert.equal(f.ownerSaves.at(-1).uid,'');assert.equal(f.get('ownerLink').hidden,true);
+  await f.get('refresh').onclick();assert.equal(f.get('ownerUid').value,'');assert.equal(f.get('clearOwner').disabled,true);
+});
+
+test('refresh during owner save cannot replace its confirmation with an older identity or revision', async () => {
+  const pending=deferred<void>();let delay=false;
+  const f=await pageFixture(async()=>response({ok:false}),undefined,async()=>{if(delay)await pending.promise;});
+  await f.get('refresh').onclick();f.get('ownerUid').value='111';
+  await f.get('ownerForm').onsubmit({preventDefault(){}});delay=true;f.get('ownerUid').value='222';
+  const save=f.get('ownerForm').onsubmit({preventDefault(){}});
+  assert.equal(f.get('saveOwner').disabled,true);await f.get('refresh').onclick();
+  assert.equal(f.get('saveOwner').disabled,true);
+  pending.resolve();await save;
+  assert.equal(f.get('ownerUid').value,'222');assert.match(f.get('ownerInfo').textContent,/UID 222/);
+  await f.get('clearOwner').onclick();assert.equal(f.get('ownerUid').value,'');
+  assert.equal(f.ownerSaves.at(-1).revision,'synthetic-owner-2');
 });

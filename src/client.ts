@@ -3,6 +3,7 @@
  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
  */
 import { BiliError } from './errors.ts';
+import { validateOwnerUid, validateOwnerProfile } from './owner.ts';
 import { validateLoginUrl } from './login-url.ts';
 import { readHistoryProgress, reportHistoryPosition } from './history-client.ts';
 import type { HistoryTarget, HistoryPositionInput } from './history-client.ts';
@@ -551,8 +552,22 @@ export class BiliClient implements BiliClientContract {
     if (!Array.isArray(data.list)) throw new BiliError('malformed_response');
     return data.list.slice(0, 1000).map((item: any) => ({ id: identifier(item.id), title: plain(item.title, 200) }));
   }
+  async ownerProfile(uid: string, options: CallOptions) {
+    const target = validateOwnerUid(uid);
+    options.assertCurrent?.();
+    const data = apiData(await this.request('/x/web-interface/card', { mid: target }, options));
+    options.assertCurrent?.();
+    try {
+      const card = record(data.card);
+      const result = validateOwnerProfile({ uid: typeof card.mid === 'number' && Number.isSafeInteger(card.mid) ? String(card.mid) : card.mid, name: card.name });
+      if (result.uid !== target) throw new BiliError('malformed_response');
+      return result;
+    } catch { throw new BiliError('malformed_response'); }
+  }
   async interact(input: InteractionInput, options: CallOptions): Promise<{ state: 'confirmed'; platformId?: string }> {
     if (!input || !['like', 'favorite', 'follow', 'comment', 'reply'].includes(input.action) || 'coinCount' in input) throw new BiliError('invalid_input');
+    if (Object.keys(input).some(key => !['action', 'aid', 'mid', 'enabled', 'folderId', 'text', 'root', 'parent', 'mentionOwner'].includes(key))) throw new BiliError('invalid_input');
+    if (input.mentionOwner !== undefined && !['comment', 'reply'].includes(input.action)) throw new BiliError('invalid_input');
     integer(input.aid); integer(input.mid);
     if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new BiliError('invalid_input');
     const cookie = checkedCookie(options.cookie); const csrf = cookieValue(cookie, 'bili_jct');
@@ -566,7 +581,15 @@ export class BiliClient implements BiliClientContract {
     else {
       path = '/x/v2/reply/add';
       if (typeof input.text !== 'string' || !input.text.trim() || [...input.text].length > 1000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(input.text)) throw new BiliError('invalid_input');
-      Object.assign(body, { oid: String(input.aid), type: '1', message: input.text, plat: '1' });
+      if (input.text.includes('@')) throw new BiliError('mention_invalid');
+      let message = input.text;
+      if (input.mentionOwner !== undefined) {
+        const owner = validateOwnerProfile(input.mentionOwner);
+        message = '@' + owner.name + ' ' + message;
+        if ([...message].length > 1000) throw new BiliError('invalid_input');
+        body.at_name_to_mid = JSON.stringify({ [owner.name]: Number(owner.uid) });
+      }
+      Object.assign(body, { oid: String(input.aid), type: '1', message, plat: '1' });
       if (input.action === 'reply') Object.assign(body, { root: identifier(input.root), parent: identifier(input.parent) });
     }
     const call = this.options(options);

@@ -8,11 +8,12 @@ import { BiliError, object, safeError } from './errors.ts';
 import { HistorySync } from './history-sync.ts';
 import { QQSharing } from './qq-share.ts';
 import type { HistoryOutcome } from './history-sync.ts';
-import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, NotificationTarget, PreparedMedia, QQVideoShareService, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
+import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, NotificationTarget, OwnerProfile, PreparedMedia, QQVideoShareService, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
 
 type WatchHistoryResult = HistoryOutcome
   | { state: 'skipped'; reason: 'history_disabled' | 'login_required' | 'permission_required' | 'sampling_unavailable' }
   | { state: 'error'; code: string };
+type OwnerSnapshot = { profile?: OwnerProfile; revision?: string };
 type Ref = { session: string; account: string; expires: number; video: VideoItem | VideoDetails; comment?: CommentItem };
 type NotificationPageRef = { session: string; account: string; expires: number; source: NotificationSource; cursor: NotificationCursor };
 type NotificationRef = { session: string; account: string; expires: number; videoTarget: string; target: NotificationTarget };
@@ -27,6 +28,7 @@ export interface RuntimeOptions {
   readHistoryLedger?: () => Promise<unknown>; saveHistoryLedger?: (value: unknown) => Promise<void>;
   recordHistory?: (sessionId: string, eventId: string) => Promise<void>;
   prepareAccount?: (signal: AbortSignal) => Promise<void>;
+  owner?: () => OwnerProfile | undefined; ownerRevision?: () => string;
 }
 function string(value: unknown, max = 200) { if (typeof value !== 'string' || !value.trim() || value.length > max || /[\x00-\x08\x0b-\x1f\x7f]/.test(value)) throw new BiliError('invalid_input'); return value.trim(); }
 function integer(value: unknown, fallback: number, min = 1, max = 100) { if (value === undefined) return fallback; if (!Number.isInteger(value) || Number(value) < min || Number(value) > max) throw new BiliError('invalid_input'); return Number(value); }
@@ -82,12 +84,24 @@ export class BiliRuntime {
     interactions: { ...this.options.config().interactions }, historySyncEnabled: this.options.config().historySyncEnabled, historyLedgerReady: this.history.ready,
     danmakuEnabled: this.options.config().danmakuEnabled, autoRefreshEnabled: this.options.config().autoRefreshEnabled,
     shareToQQEnabled: this.options.config().shareToQQEnabled, qqShareAvailable: this.qq.available,
-    ledgerReady: this.ledgerReady, activeRequests: this.active + this.qq.activeRequests, platformNetwork: 'direct' }; }
+    ownerConfigured: Boolean(this.options.owner?.()), ledgerReady: this.ledgerReady, activeRequests: this.active + this.qq.activeRequests, platformNetwork: 'direct' }; }
   setQQ(binding?: OptionalService<QQVideoShareService>) { this.qq.set(binding); }
   invalidateQQShares() { this.qq.invalidate(); }
   shareToQQ(raw: unknown, session: ToolSession, query = false) { return this.qq.share(raw, session, query); }
   setVision(binding?: OptionalService<VisionService>) { this.vision = binding; for (const ref of this.media.values()) void this.release(ref); this.media.clear(); this.pendingMedia.clear(); }
   invalidateHistoryProofs() { this.history.clearProofs(); }
+  private captureOwner(): OwnerSnapshot {
+    const profile = this.options.owner?.();
+    return { profile: profile ? { uid: profile.uid, name: profile.name } : undefined, revision: this.options.ownerRevision?.() };
+  }
+  private checkOwner(snapshot: OwnerSnapshot | undefined): OwnerProfile {
+    if (!snapshot) throw new BiliError('owner_required');
+    const current = this.captureOwner();
+    if (current.revision !== snapshot.revision || current.profile?.uid !== snapshot.profile?.uid || current.profile?.name !== snapshot.profile?.name)
+      throw new BiliError('owner_changed');
+    if (!snapshot.profile) throw new BiliError('owner_required');
+    return snapshot.profile;
+  }
   private identity() { return this.options.accountRevision?.() ?? this.options.account()?.revision ?? 'anonymous'; }
   private guard() { if (this.options.signal.aborted || this.controller.signal.aborted) throw new BiliError('stopped'); if (!this.options.transient) throw new BiliError('host_required'); }
   private checkOperation(identity: string, options: CallOptions) {
@@ -220,6 +234,14 @@ export class BiliRuntime {
   async read(action: string, raw: unknown, session: ToolSession): Promise<TransientToolOutput> {
     try {
       const args = object(raw);
+      if (action === 'owner') {
+        this.guard(); if (!session.id) throw new BiliError('session_required');
+        if (session.signal?.aborted) throw new BiliError('cancelled');
+        if (Object.keys(args).length) throw new BiliError('invalid_input');
+        const profile = this.captureOwner().profile;
+        return { content: { status: 'ok', data: { owner: profile ? { ...profile, url: 'https://space.bilibili.com/' + profile.uid } : null, untrusted: true } },
+          receipt: { action: 'bilibili_owner', status: 'ok' } };
+      }
       if (action === 'danmaku' && !this.options.config().danmakuEnabled) throw new BiliError('danmaku_disabled');
       const data = await this.operation(session, async (id, options, identity) => {
         if (action === 'notifications') {
@@ -369,27 +391,47 @@ export class BiliRuntime {
   }
 
   async interact(raw: unknown, session: ToolSession): Promise<TransientToolOutput> {
-    const job = this.actionQueue.then(() => this.performInteraction(raw, session)); this.actionQueue = job.catch(() => {}); return job;
+    try {
+      // Capture caller input and the configured recipient before waiting behind other actions.
+      const args = { ...object(raw) }, owner = args.mentionOwner === true ? this.captureOwner() : undefined;
+      const job = this.actionQueue.then(() => this.performInteraction(args, session, owner));
+      this.actionQueue = job.catch(() => {}); return job;
+    } catch (error) {
+      const e = safeError(error);
+      return { content: { status: 'error', error: e, state: 'rejected' }, receipt: { action: 'bilibili_interact', state: 'rejected', code: e.code } };
+    }
   }
-  private async performInteraction(raw: unknown, session: ToolSession): Promise<TransientToolOutput> {
+  private async performInteraction(raw: unknown, session: ToolSession, owner?: OwnerSnapshot): Promise<TransientToolOutput> {
     let entry: LedgerEntry | undefined;
     let submitted = false;
     try {
       const args = object(raw), action = string(args.action) as Action;
-      if (!['like', 'favorite', 'follow', 'comment', 'reply'].includes(action) || 'coinCount' in args) throw new BiliError('invalid_input');
-      if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
-      const data = await this.operation(session, async (id, options) => {
+      if (!['like', 'favorite', 'follow', 'comment', 'reply'].includes(action)
+        || Object.keys(args).some(key => !['action', 'videoRef', 'commentRef', 'operationId', 'text', 'mentionOwner', 'sessionId'].includes(key))
+        || args.mentionOwner !== undefined && typeof args.mentionOwner !== 'boolean'
+        || args.mentionOwner === true && action !== 'comment' && action !== 'reply') throw new BiliError('invalid_input');
+      const check = () => {
         if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
+        if (session.permission !== 'full') throw new BiliError('permission_required');
+        if (args.mentionOwner === true) this.checkOwner(owner);
+      };
+      check();
+      const text = action === 'comment' || action === 'reply' ? string(args.text, 1000) : undefined;
+      if (text?.includes('@')) throw new BiliError('mention_invalid');
+      // Legacy raw sessionId is tolerated but never used for references, routing or action keys.
+      const mentionOwner = args.mentionOwner === true ? this.checkOwner(owner) : undefined;
+      const data = await this.operation(session, async (id, options) => {
+        check();
         if (!this.ledgerReady) throw new BiliError('persistence_error');
         const account = this.options.account(); if (!account) throw new BiliError('login_required');
         const ref = this.get(action === 'reply' ? args.commentRef : args.videoRef, id);
         if (action === 'reply' && !ref.comment) throw new BiliError('invalid_input');
         const op = string(args.operationId, 100);
-        const text = action === 'comment' || action === 'reply' ? string(args.text, 1000) : undefined;
         const folderId = action === 'favorite' ? this.options.config().favoriteFolderId : undefined;
         if (action === 'favorite' && !folderId) throw new BiliError('folder_required');
         const key = hash([account.mid, id, op]);
-        const payload = [account.mid, action, ref.video.aid, ref.video.owner.mid, ref.comment?.rpid, folderId, text];
+        const payload: unknown[] = [account.mid, action, ref.video.aid, ref.video.owner.mid, ref.comment?.rpid, folderId, text];
+        if (mentionOwner) payload.push({ mentionOwner });
         const fingerprint = hash(payload);
         const previous = this.ledger.find(e => e.key === key) ?? this.ledger.find(e => e.state !== 'rejected' && e.fingerprint === fingerprint);
         if (previous?.key === key && previous.fingerprint !== fingerprint) throw new BiliError('invalid_input');
@@ -398,19 +440,20 @@ export class BiliRuntime {
           return { state: previous.state === 'pending' ? 'uncertain' : previous.state, duplicate: true, platformId: previous.platformId };
         }
         if (this.ledger.length >= 4096) throw new BiliError('busy');
-        const verified = await this.client.account(options);
+        const verified = await this.client.account(options); check();
         if (verified.mid !== account.mid || this.identity() !== account.revision) throw new BiliError('account_changed');
         if (action === 'favorite' && !(await this.client.folders(account.mid, options)).some(folder => folder.id === folderId)) throw new BiliError('folder_required');
-        if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
+        check();
         options.signal?.throwIfAborted();
         entry = { key, fingerprint, state: 'pending' }; this.ledger.push(entry);
         try { await this.options.saveLedger({ entries: this.ledger }); }
         catch { this.ledgerReady = false; throw new BiliError('persistence_error'); }
         options.signal?.throwIfAborted();
         if (this.identity() !== account.revision) throw new BiliError('account_changed');
-        if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
+        check();
         submitted = true;
         const result = await this.client.interact({ action, aid: ref.video.aid, mid: ref.video.owner.mid, enabled: true, folderId, text,
+          ...(mentionOwner ? { mentionOwner: { ...mentionOwner } } : {}),
           ...(ref.comment ? { parent: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root } : {}) }, options);
         entry.state = 'confirmed'; entry.platformId = result.platformId;
         let ledgerSaved = true;

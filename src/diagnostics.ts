@@ -38,6 +38,7 @@ const apiPaths: Readonly<Record<string, string>> = Object.freeze({
   '/x/player/v2': 'subtitle_tracks',
   '/x/player/playurl': 'play_url',
   '/x/web-interface/nav': 'account',
+  '/x/web-interface/card': 'owner_profile',
   '/x/v3/fav/folder/created/list-all': 'favorite_folders',
   '/x/web-interface/archive/like': 'like',
   '/x/v3/fav/resource/deal': 'favorite',

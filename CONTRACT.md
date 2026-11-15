@@ -1,11 +1,12 @@
 # B 站子插件契约
 
-插件 0.2.4，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.5，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
 | 工具 | 参数与语义 |
 | --- | --- |
+| bilibili_owner | 无参数，读取本插件保存的主人 uid/name/url 或 null；临时结果，本地读取不联网、不触发登录续期 |
 | bilibili_browse | source=`recommended|following`，可选page/cursor；返回视频引用及下一页信息 |
 | bilibili_search | query、可选page；返回站内视频搜索结果 |
 | bilibili_open | target为普通视频URL/BV/av号/短链；返回资料、分P及videoRef |
@@ -16,7 +17,7 @@
 | bilibili_danmaku | videoRef、可选part/fromSeconds/toSeconds/offset；需danmakuEnabled，默认0–30秒、窗口最多60秒，100条一页 |
 | bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件、实际覆盖说明及historySync；启用且登录/full时同次自动同步位置 |
 | bilibili_mark_history | watchRef、稳定operationId；保留旧调用兼容，需登录、historySyncEnabled与full权限；正常watch已自动同步，无需补调 |
-| bilibili_interact | action仅限like/favorite/follow/comment/reply、operationId、videoRef或commentRef，以及评论/回复text；受独立开关、账号与full权限约束 |
+| bilibili_interact | action仅限like/favorite/follow/comment/reply、operationId、videoRef或commentRef，以及评论/回复text、可选mentionOwner布尔值；true只用于评论/回复，由配置确定唯一主人；受独立开关、账号与full权限约束 |
 | bilibili_share_qq | videoRef、userId、operationId；需shareToQQEnabled、full权限及兼容QQ服务，按QQ设置以图文或小程序分享当前会话视频 |
 | bilibili_share_qq_delivery | userId、原operationId；查询同一可信会话的QQ发送回执，不发送；关闭开关或引用过期后仍可查 |
 
@@ -29,6 +30,12 @@ QQ 分享仅在 `ctx.optional('qq')` 绑定有效且 `videoShareApiVersion === '
 QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有效平台消息ID才confirmed；not_found仅用于查询。固定 `retryAutomatically:false/canRetry:false`，B站无自动重试、换格式回退或换ID补发；不调用旧小程序发送入口。持久防重记录属于QQ插件，原动作跨B站插件重载仍可查询；B站插件不另存标题、链接或签名。异常跨过提供方调用边界后保守报uncertain，已可靠确认发送的回执不因随后取消改成未发。仅投影预期字段及固定安全错误，不把提供方原始异常、ARK或外部正文写入回执。`format`反映原动作的card或miniapp，`coverIncluded`仅表示图文准备包含封面，不代表接收端已显示；无记录、服务不可用等未给格式时不推断。平台成功但落盘失败仍保留sent、平台消息ID、ledgerSaved:false及固定storage错误，禁止重发。
 
 格式完全由QQ配置 `videoShareFormat` 决定，默认card，可选miniapp；消费者不传format、ARK或额外消息段。card为一次普通图文消息，点击其中完整文字链接打开视频，封面本身不跳转。空封面以空字符串传递，由QQ按模式决定是否接受；其他不合法封面仍拒绝。QQ可在平台提交前处理封面失败为同次纯文字消息，但消费者不补发。miniapp由QQ生成签名并原样发送，仍有手机播放/打开App兼容问题。新服务缺失时仅停用分享，不把旧小程序入口冒充支持图文；不自动点击网页分享控件，不保证B站分享计数增加。
+
+主人资料独立存于本插件 `data/owner.json`，仅含 `{owner:{uid,name}|null}`；`GET owner` 返回 owner（含派生主页 url）、revision、invalidStoredState，`POST owner` 只接受 uid 与 revision。UID 为空字符串表示清除，否则需规范正十进制安全整数（输入前后空格可去掉）。保存前用固定 `/x/web-interface/card?mid=...` 获取公开昵称并核对返回 UID，不接受浏览器或模型自填的姓名；只保存 UID 和原样有效昵称，不保存简介、统计、头像等扩展资料。登录 Cookie 可用于该查询但不复制入主人资料。加载不联网、重启保留；修改串行且检查 revision，获取或落盘失败保留旧设置。取消、换账号、停止会阻止尚未开始的保存；保存已开始且成功时以落盘结果为准，不假称回滚。坏文件不启用提及，用户可重新获取或清除。此资料不写主干人格、事实或聊天记忆。
+
+`bilibili_owner` 走临时工具，仅本地读取；公开 status 只增加 ownerConfigured 布尔值，不返回主人昵称或 UID。`bilibili_interact` 增加可选 `mentionOwner:boolean`，默认false。true时在调用入队捕获主人资料及代际，在等待、账号校验和pending落盘后直至提交前再次核对，改动或清除则报owner_changed；未设置报owner_required。模型不能指定UID、昵称或原始at映射；正文中的ASCII @ 会被拒绝并提示使用mentionOwner。实际POST的message为`@昵称 正文`，同时发送`at_name_to_mid={"昵称":数字UID}`，只有一个键；UID限制安全整数避免舍入，包含前缀的正文仍限1000字符。主人UID/昵称参与提及动作指纹；不提及的旧动作散列保持兼容。确认/不确定动作沿用持久防重语义，主人变化不会使旧动作自动重放。回执、经历、日志不含主人资料、原文或映射；平台确认只证明评论发表，不证明通知送达。回复他人本身的回复通知不属于额外@对象。
+
+协议依据为维护者的 [OpenCLI评论实现](https://github.com/jackwener/opencli/blob/main/clis/bilibili/comment.js) 及 [B站API收集项目的资料接口](https://github.com/bilibili-plugins/bilibili-api-collect/blob/master/docs/user/info.md)。这是社区维护的接口证据，不是B站官方稳定性保证；未复制第三方代码。
 
 确认的互动通过 `memory.recordExperience` 记录固定动作说明；事件标识使用动作散列，重复补记幂等。记忆失败只影响 `experienceRecorded`，不把已经完成的外部动作重新提交。
 
@@ -46,7 +53,7 @@ QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有�
 
 历史写入使用独立持久记录和既有动作队列，先落pending再请求；同operationId改变内容拒绝，相同动作指纹防重，重启pending按uncertain处理。`accepted`仅表示接口接受；`verified`表示本次提交且历史回读位置不低于采样位置；`already_recorded`表示已有位置足够、没有提交；`rejected`是确定拒绝；`uncertain`不自动重发。只在submitted且verified后通过公开记忆接口写固定经历，补记失败不重发。近期历史查询限30条，缺席不证明没有旧记录；已知更高位置不回退，但不承诺发现更早历史或跨设备并发。POST只含aid/cid/progress/csrf，不发送观看心跳、播放时长或完成标记，不保证播放量。
 
-设置路径均位于 `/plugins/surf/bilibili/`，继承宿主鉴权与来源检查。GET settings/config/state/folders，POST config/login/start/login/poll/login/import/login/logout。配置与账号修改采用各自 revision，拒绝过期编辑；二维码只由本地编码器生成，登录密钥不返回状态。Cookie不随重定向传播到CDN。网络请求仅HTTPS、公网DNS校验并固定连接地址，压缩前后限量、限时、可取消，无自动业务重试。
+设置路径均位于 `/plugins/surf/bilibili/`，继承宿主鉴权与来源检查。GET settings/config/state/folders/owner，POST config/login/start/login/poll/login/import/login/logout/owner。配置与账号修改采用各自 revision，拒绝过期编辑；二维码只由本地编码器生成，登录密钥不返回状态。Cookie不随重定向传播到CDN。网络请求仅HTTPS、公网DNS校验并固定连接地址，压缩前后限量、限时、可取消，无自动业务重试。
 
 搜索采用 `/x/web-interface/wbi/search/type`。已有 Cookie 中的 `buvid3` 优先；缺少时从固定的 `/x/web-frontend/getbuvid` 读取服务器下发值。导航接口 `/x/web-interface/nav` 提供 WBI 键，匿名 `code:-101` 且带有效键仍可用于公开搜索，不当作登录成功。准备状态按当前完整登录 Cookie 隔离，只保留在客户端内存；签名键缓存5分钟，并发准备合并，各阶段检查取消、停止和当前账号代际；切换账号或注销后不再发出后续旧凭据请求。换凭据后的调用不复用旧身份的站点 Cookie。搜索返回 `v_voucher` 明确视为 `access_blocked`，不交出验证令牌、不自动重试或刷新设备值；本地账号文件不变。
 
