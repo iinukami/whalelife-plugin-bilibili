@@ -97,15 +97,21 @@ for (const baseline of [HISTORY_HOST, MINIMUM_HOST]) {
     await f.plugin('surf/bilibili', `
 import { BiliClient } from ${JSON.stringify(pathToFileURL(join(root, 'src/client.ts')).href)};
 export function apply(ctx) {
-  let scenario = 'success', trackRequests = 0, bodyRequests = 0;
+  let scenario = 'success', trackRequests = 0, bodyRequests = 0, preparationRequests = 0;
   const client = new BiliClient({ signal: ctx.signal, onDiagnostic: event => ctx.logger.warn('B 站请求失败', event), transport: {
     async request(url, options) {
       if ((options.method ?? 'GET') !== 'GET') throw Error('Synthetic subtitle fixture permits reads only');
       let body;
-      if (new URL(url).pathname === '/x/player/v2') {
+      if (new URL(url).pathname === '/x/web-frontend/getbuvid') {
+        preparationRequests++; body = { code: 0, data: { buvid: 'SYNTHETIC_SUBTITLE_DEVICE' } };
+      } else if (new URL(url).pathname === '/x/web-interface/nav' && options.diagnosticPurpose === 'subtitle_keys') {
+        preparationRequests++; body = { code: 0, data: { wbi_img: {
+          img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
+          sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } } };
+      } else if (new URL(url).pathname === '/x/player/wbi/v2') {
         trackRequests++;
-        if (options.headers?.Cookie !== ${JSON.stringify(SYNTHETIC_COOKIE)}) throw Error('Expected synthetic track cookie');
-        body = { code: 0, data: { subtitle: { subtitles: [{
+        if (options.headers?.Cookie !== ${JSON.stringify(SYNTHETIC_COOKIE + '; buvid3=SYNTHETIC_SUBTITLE_DEVICE')}) throw Error('Expected synthetic track cookie');
+        body = { code: 0, data: { bvid: 'BV1xx411c7mD', cid: 98765, subtitle: { subtitles: [{
           id_str: scenario === 'invalid_track' ? ${JSON.stringify(privateId)} : '12345',
           subtitle_url: ${JSON.stringify(signedUrl)}, lan: 'zh-CN', lan_doc: 'SYNTHETIC_PRIVATE_TRACK_LABEL', uid: 846726391055582
         }] } } };
@@ -131,7 +137,7 @@ export function apply(ctx) {
         const cues = await client.subtitle(result.tracks[0].url, { cookie: ${JSON.stringify(SYNTHETIC_COOKIE)}, signal: ctx.signal });
         return { ok: true, tracks: result.tracks.length, cues: cues.length };
       } catch (error) { return { ok: false, code: error.code ?? 'unexpected' }; }
-    }, counts: () => ({ trackRequests, bodyRequests }),
+    }, counts: () => ({ trackRequests, bodyRequests, preparationRequests }),
   });
 }`, { depends: ['surf'] });
     await f.app.runtime.action('surf/bilibili', 'reload');
@@ -142,7 +148,7 @@ export function apply(ctx) {
     await until(() => diagnostics().length === 1, 'subtitle track parse failure did not reach host log');
     const tracks = diagnostics()[0];
     assert.equal(tracks.endpoint, 'subtitle_tracks'); assert.equal(tracks.phase, 'subtitle_tracks'); assert.equal(tracks.stage, 'parse');
-    assert.equal(tracks.path, '/x/player/v2'); assert.equal(tracks.host, 'api.bilibili.com'); assert.equal(tracks.hasSessionCookie, true);
+    assert.equal(tracks.path, '/x/player/wbi/v2'); assert.equal(tracks.host, 'api.bilibili.com'); assert.equal(tracks.hasSessionCookie, true);
     assert.equal(tracks.reason, 'track_rejected'); assert.equal(tracks.field, 'data.subtitle.subtitles');
     assert.equal(tracks.itemCount, 1); assert.equal(tracks.examinedCount, 1); assert.equal(tracks.acceptedCount, 0); assert.equal(tracks.rejectedCount, 1);
     assert.deepEqual(tracks.issues, [{ reason: 'invalid_track_id', field: 'track.id_str', actualType: 'string', itemIndex: 0, constraint: 'identifier' }]);
@@ -154,7 +160,7 @@ export function apply(ctx) {
     assert.equal(body.reason, 'invalid_cue_content'); assert.equal(body.field, 'cue.content'); assert.equal(body.actualType, 'object');
     assert.equal(body.itemIndex, 1); assert.equal(body.itemCount, 2); assert.equal(body.acceptedCount, 1); assert.equal(body.constraint, 'string');
     assert.deepEqual(await service.run('success'), { ok: true, tracks: 1, cues: 2 });
-    assert.deepEqual(await service.counts(), { trackRequests: 3, bodyRequests: 2 });
+    assert.deepEqual(await service.counts(), { trackRequests: 3, bodyRequests: 2, preparationRequests: 2 });
     const ids = diagnostics().map((entry: any) => entry.requestId);
     assert.equal(new Set(ids).size, 2);
     await until(async () => {
@@ -165,7 +171,7 @@ export function apply(ctx) {
       assert.match(entry.requestId, /^[0-9a-f-]{36}$/); assert.equal(entry.method, 'GET'); assert.equal(entry.httpStatus, 200);
       assert.equal(entry.errorCode, 'malformed_response'); assert.ok(entry.elapsedMs >= 0); assert.ok(entry.responseBytes > 0);
     }
-    await f.assertPrivate([signedUrl, 'SYNTHETIC_SUBTITLE_SIGNATURE', '846726391055582', privateId, privateText, 'SYNTHETIC_PRIVATE_TRACK_LABEL']);
+    await f.assertPrivate([signedUrl, 'SYNTHETIC_SUBTITLE_SIGNATURE', '846726391055582', privateId, privateText, 'SYNTHETIC_PRIVATE_TRACK_LABEL', 'SYNTHETIC_SUBTITLE_DEVICE']);
     assert.equal(diagnostics().length, 2, 'successful track/body reads must not log diagnostics');
     assert.equal(f.requests.length, 0, 'subtitle diagnostics must not call a model');
   });

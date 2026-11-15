@@ -23,7 +23,7 @@ function fixture() {
       // Preparation has dedicated protocol tests; these cases focus on normalizing result data.
       if (path === '/x/web-frontend/getbuvid') return { status: 200, headers: {}, url,
         body: Buffer.from(JSON.stringify({ code: 0, data: { buvid: 'SYNTHETIC_SEARCH_DEVICE' } })) };
-      if (path === '/x/web-interface/nav' && options.diagnosticPurpose === 'search_keys') return { status: 200, headers: {}, url,
+      if (path === '/x/web-interface/nav' && ['search_keys', 'subtitle_keys'].includes(options.diagnosticPurpose ?? '')) return { status: 200, headers: {}, url,
         body: Buffer.from(JSON.stringify({ code: 0, data: { wbi_img: {
           img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
           sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } } })) };
@@ -78,11 +78,11 @@ test('malformed supported video candidates and declared subtitle tracks cannot m
   f.json({ item: [{ goto: 'av', bvid: BV }] }); await assert.rejects(f.client.feed('recommended', 1, undefined, {}), errorCode('malformed_response'));
   f.json({ items: [{ type: 'DYNAMIC_TYPE_AV', modules: {} }] }); await assert.rejects(f.client.feed('following', 1, undefined, { cookie: COOKIE }), errorCode('malformed_response'));
   f.json({ result: [{ type: 'video', bvid: BV }], numPages: 1 }); await assert.rejects(f.client.search('q', 1, {}), errorCode('malformed_response'));
-  f.json({ subtitle: { subtitles: [{ id: 1, lan: 'zh', subtitle_url: 'https://127.0.0.1/private' }] } });
+  f.json({ bvid: BV, cid: 10, subtitle: { subtitles: [{ id: 1, lan: 'zh', subtitle_url: 'https://127.0.0.1/private' }] } });
   await assert.rejects(f.client.subtitles(BV, 10, {}), errorCode('malformed_response'));
   f.json({ item: [{ goto: 'ad' }] }); assert.deepEqual((await f.client.feed('recommended', 1, undefined, {})).items, []);
   f.json({ result: [], numPages: 0 }); assert.deepEqual((await f.client.search('q', 1, {})).items, []);
-  f.json({ subtitle: { subtitles: [] }, need_login_subtitle: true });
+  f.json({ bvid: BV, cid: 10, subtitle: { subtitles: [] }, need_login_subtitle: true });
   assert.deepEqual(await f.client.subtitles(BV, 10, {}), { tracks: [], loginRequired: true });
 });
 
@@ -235,7 +235,7 @@ test('only official-discovered subtitles and images can be downloaded and never 
   await assert.rejects(f.client.subtitle(subtitle, { cookie: COOKIE }), errorCode('unsafe_url'));
   await assert.rejects(f.client.image('https://i0.hdslb.com/synthetic.jpg', 1024, { cookie: COOKIE }), errorCode('unsafe_url'));
   assert.equal(f.calls.length, 0);
-  f.json({ subtitle: { subtitles: [{ id_str: '9007199254740993123', lan: 'zh-CN', lan_doc: '中文', subtitle_url: subtitle }] }, need_login_subtitle: false });
+  f.json({ bvid: BV, cid: 10, subtitle: { subtitles: [{ id_str: '9007199254740993123', lan: 'zh-CN', lan_doc: '中文', subtitle_url: subtitle }] }, need_login_subtitle: false });
   const tracks = await f.client.subtitles(BV, 10, { cookie: COOKIE }); assert.equal(tracks.tracks.length, 1);
   f.queue.push({ body: Buffer.from(JSON.stringify({ body: [{ from: 1.5, to: 4, content: '合成字幕' }] })) });
   assert.deepEqual(await f.client.subtitle(subtitle, { cookie: COOKIE }), [{ from: 1.5, to: 4, text: '合成字幕' }]);

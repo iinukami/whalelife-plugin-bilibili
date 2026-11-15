@@ -14,7 +14,7 @@ const COOKIE = 'SESSDATA=SECRET_COOKIE; bili_jct=SECRET_CSRF; DedeUserID=123';
 const subtitleUrl = 'https://aisubtitle.hdslb.com/SECRET_SUBTITLE_PATH.json?auth_key=SECRET_SIGNATURE';
 const cue = { from: 0, to: 2, content: 'SECRET_SUBTITLE_TEXT' };
 const track = (extra: Record<string, unknown> = {}) => ({ id_str: '1234567890123456789', lan: 'ai-zh', lan_doc: 'SECRET_LANGUAGE_LABEL', subtitle_url: subtitleUrl, ...extra });
-const player = (tracks: unknown) => ({ code: 0, data: { subtitle: { subtitles: tracks }, need_login_subtitle: false } });
+const player = (tracks: unknown) => ({ code: 0, data: { bvid: BV, cid: 456, subtitle: { subtitles: tracks }, need_login_subtitle: false } });
 const json = (value: unknown, status = 200): Partial<TransportResponse> => ({ status, body: Buffer.from(JSON.stringify(value)), headers: { 'content-type': 'application/json', 'set-cookie': 'SECRET_SET_COOKIE' } });
 const errorCode = (code: string) => (error: unknown) => error instanceof BiliError && error.code === code;
 type ResponseFactory = (url: string, options: TransportOptions) => Promise<Partial<TransportResponse>>;
@@ -25,6 +25,13 @@ function fixture(sink?: DiagnosticSink, responder?: ResponseFactory) {
   const client = new BiliClient({ onDiagnostic: sink ?? (event => { events.push(event); }), transport: {
     async request(url, options) {
       calls.push({ url, options });
+      const path = new URL(url).pathname;
+      if (path === '/x/web-frontend/getbuvid') return { status: 200, headers: {}, url,
+        body: Buffer.from(JSON.stringify({ code: 0, data: { buvid: 'SECRET_SERVER_ISSUED_DEVICE' } })) };
+      if (path === '/x/web-interface/nav' && options.diagnosticPurpose === 'subtitle_keys') return { status: 200, headers: {}, url,
+        body: Buffer.from(JSON.stringify({ code: 0, data: { wbi_img: {
+          img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
+          sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } } })) };
       const next = responder ? await responder(url, options) : queue.shift();
       assert.ok(next, 'missing synthetic response');
       if (next instanceof Error) throw next;
@@ -34,12 +41,13 @@ function fixture(sink?: DiagnosticSink, responder?: ResponseFactory) {
   return { client, events, calls, queue, disposals: () => disposals };
 }
 const eventKeys = new Set(['requestId', 'endpoint', 'host', 'path', 'method', 'hasSessionCookie', 'elapsedMs', 'stage', 'httpStatus', 'apiCode', 'errorCode',
-  'phase', 'reason', 'field', 'actualType', 'itemIndex', 'itemCount', 'examinedCount', 'acceptedCount', 'rejectedCount', 'responseBytes', 'issues', 'constraint', 'limit']);
-const fields = new Set(['$', 'code', 'data', 'data.subtitle', 'data.subtitle.subtitles', 'track', 'track.subtitle_url', 'track.id', 'track.id_str', 'body', 'cue', 'cue.from', 'cue.to', 'cue.content', 'response.url']);
+  'phase', 'reason', 'field', 'actualType', 'urlProblem', 'itemIndex', 'itemCount', 'examinedCount', 'acceptedCount', 'rejectedCount', 'responseBytes', 'issues', 'constraint', 'limit']);
+const fields = new Set(['$', 'code', 'data', 'data.subtitle', 'data.subtitle.subtitles', 'data.bvid', 'data.cid', 'data.buvid', 'data.wbi_img', 'track', 'track.subtitle_url', 'track.id', 'track.id_str', 'body', 'cue', 'cue.from', 'cue.to', 'cue.content', 'response.url']);
 const types = new Set(['undefined', 'null', 'array', 'object', 'string', 'boolean', 'number', 'non_finite_number', 'unsafe_integer', 'other']);
 const reasons = new Set(['invalid_json', 'invalid_envelope', 'invalid_data', 'invalid_track_list', 'invalid_track', 'invalid_track_url', 'invalid_track_id', 'track_rejected',
-  'invalid_cue_list', 'invalid_cue', 'invalid_cue_time', 'invalid_cue_content', 'cue_limit', 'text_limit', 'invalid_response_url']);
+  'invalid_cue_list', 'invalid_cue', 'invalid_cue_time', 'invalid_cue_content', 'cue_limit', 'text_limit', 'invalid_response_url', 'identity_mismatch', 'invalid_device_cookie', 'invalid_wbi_keys']);
 const constraints = new Set(['finite_number', 'non_negative', 'ordered', 'string', 'identifier', 'trusted_url', 'object', 'array', 'max_cues', 'max_text']);
+const urlProblems = new Set(['empty', 'non_string', 'invalid_url', 'non_https', 'credentials', 'custom_port', 'fragment', 'whitespace', 'too_long', 'non_public_host']);
 function privateSafe(events: RequestDiagnostic[]) {
   const serialized = JSON.stringify(events);
   for (const value of ['SECRET_', BV, 'SESSDATA=', 'bili_jct=', 'DedeUserID=', 'auth_key', 'aisubtitle.hdslb.com', 'set-cookie', 'stack', 'headers'])
@@ -48,20 +56,22 @@ function privateSafe(events: RequestDiagnostic[]) {
     assert.deepEqual(Object.keys(event).filter(key => !eventKeys.has(key)), []);
     assert.match(event.requestId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
     assert.ok(Number.isInteger(event.elapsedMs) && event.elapsedMs >= 0);
-    assert.ok(['subtitle_tracks', 'subtitle_body'].includes(event.phase!));
+    assert.ok(['subtitle_prepare', 'subtitle_tracks', 'subtitle_body'].includes(event.phase!));
     assert.equal(event.method, 'GET');
     if (event.reason !== undefined) assert.ok(reasons.has(event.reason));
     if (event.field !== undefined) assert.ok(fields.has(event.field));
     if (event.actualType !== undefined) assert.ok(types.has(event.actualType));
     if (event.constraint !== undefined) assert.ok(constraints.has(event.constraint));
+    if (event.urlProblem !== undefined) assert.ok(urlProblems.has(event.urlProblem));
     for (const key of ['itemIndex', 'itemCount', 'examinedCount', 'acceptedCount', 'rejectedCount', 'responseBytes', 'limit'] as const)
       if (event[key] !== undefined) assert.ok(Number.isSafeInteger(event[key]) && event[key]! >= 0, key);
     assert.ok((event.issues?.length ?? 0) <= 5);
     for (const issue of event.issues ?? []) {
-      assert.deepEqual(Object.keys(issue).filter(key => !['reason', 'field', 'actualType', 'itemIndex', 'constraint'].includes(key)), []);
+      assert.deepEqual(Object.keys(issue).filter(key => !['reason', 'field', 'actualType', 'itemIndex', 'constraint', 'urlProblem'].includes(key)), []);
       assert.ok(reasons.has(issue.reason)); assert.ok(fields.has(issue.field)); if (issue.actualType !== undefined) assert.ok(types.has(issue.actualType));
       assert.ok(Number.isSafeInteger(issue.itemIndex) && issue.itemIndex! >= 0);
       if (issue.constraint !== undefined) assert.ok(constraints.has(issue.constraint));
+      if (issue.urlProblem !== undefined) assert.ok(urlProblems.has(issue.urlProblem));
     }
   }
 }
@@ -88,7 +98,7 @@ test('subtitle track JSON and envelope failures receive one fixed response diagn
     await assert.rejects(f.client.subtitles(BV, 456, { cookie: COOKIE }), errorCode('malformed_response'));
     const event = only(f, 'subtitle_tracks', 'response', example.reason);
     assert.equal(event.httpStatus, 200); assert.equal(event.hasSessionCookie, true);
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 3);
   }
 });
 
@@ -104,16 +114,16 @@ test('subtitle data and track-list structural errors record their fixed field an
     await assert.rejects(f.client.subtitles(BV, 456, {}), errorCode('malformed_response'));
     const event = only(f, 'subtitle_tracks', 'parse', example.reason);
     assert.equal(event.field, example.field); assert.equal(event.actualType, example.actualType);
-    assert.equal(event.responseBytes, response.body!.length); assert.equal(f.calls.length, 1);
+    assert.equal(event.responseBytes, response.body!.length); assert.equal(f.calls.length, 3);
   }
 });
 
-test('malformed optional subtitle containers keep legacy empty results while recording their shape', async t => {
+test('malformed optional subtitle containers reject rather than masquerading as absent subtitles', async t => {
   for (const [value, actualType] of [['SECRET_SUBTITLE_CONTAINER', 'string'], [[], 'array'], [42, 'number']] as const) {
     const f = fixture(); t.after(() => f.client.dispose()); f.queue.push(json({ code: 0, data: { subtitle: value } }));
-    assert.deepEqual(await f.client.subtitles(BV, 456, {}), { tracks: [], loginRequired: false });
+    await assert.rejects(f.client.subtitles(BV, 456, {}), errorCode('malformed_response'));
     const event = only(f, 'subtitle_tracks', 'parse', 'invalid_track_list');
-    assert.equal(event.field, 'data.subtitle'); assert.equal(event.actualType, actualType); assert.equal(f.calls.length, 1);
+    assert.equal(event.field, 'data.subtitle'); assert.equal(event.actualType, actualType); assert.equal(f.calls.length, 3);
   }
 });
 
@@ -123,7 +133,7 @@ test('changed or unsafe player response URLs retain unsafe_url without disclosin
     await assert.rejects(f.client.subtitles(BV, 456, {}), errorCode('unsafe_url'));
     const event = only(f, 'subtitle_tracks', 'parse', 'invalid_response_url');
     assert.equal(event.field, 'response.url'); assert.equal(event.constraint, 'trusted_url'); assert.equal(event.errorCode, 'unsafe_url');
-    assert.equal(event.host, 'api.bilibili.com'); assert.equal(event.path, '/x/player/v2'); assert.equal(f.calls.length, 1);
+    assert.equal(event.host, 'api.bilibili.com'); assert.equal(event.path, '/x/player/wbi/v2'); assert.equal(f.calls.length, 3);
     assert.equal(JSON.stringify(event).includes('public.example'), false); assert.equal(JSON.stringify(event).includes('127.0.0.1'), false);
   }
 });
@@ -145,7 +155,7 @@ test('rejected tracks aggregate safe structural, URL and ID issue details withou
     const event = only(f, 'subtitle_tracks', 'parse', 'track_rejected');
     assert.equal(event.itemCount, 1); assert.equal(event.examinedCount, 1); assert.equal(event.acceptedCount, 0); assert.equal(event.rejectedCount, 1);
     assert.equal(event.issues?.length, 1); assert.equal(event.issues?.[0].reason, example.reason); assert.equal(event.issues?.[0].itemIndex, 0);
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 3);
   }
 });
 
@@ -161,7 +171,7 @@ test('mixed track results retain valid tracks, cap issue details and count only 
   assert.equal(event.issues?.length, 5); assert.deepEqual(event.issues?.map(issue => issue.itemIndex), [0, 1, 2, 3, 4]);
   f.queue.push(json({ body: [cue] }));
   assert.equal((await f.client.subtitle(result.tracks[0].url, { cookie: COOKIE })).length, 1);
-  assert.equal(f.events.length, 1); assert.equal(f.calls.length, 2); assert.equal(f.calls[1].options.headers?.Cookie, undefined);
+  assert.equal(f.events.length, 1); assert.equal(f.calls.length, 4); assert.equal(f.calls.at(-1)!.options.headers?.Cookie, undefined);
 });
 
 test('subtitle body invalid JSON, envelope and cue-list errors carry the body phase without a duplicate event', async t => {
@@ -177,7 +187,7 @@ test('subtitle body invalid JSON, envelope and cue-list errors carry the body ph
     await assert.rejects(f.client.subtitle(url, { cookie: COOKIE }), errorCode('malformed_response'));
     const event = only(f, 'subtitle_body', example.stage, example.reason);
     assert.equal(event.hasSessionCookie, false); assert.equal(event.host, undefined); assert.equal(event.path, undefined);
-    assert.equal(event.responseBytes, example.response.body!.length); assert.equal(f.calls.length, 2);
+    assert.equal(event.responseBytes, example.response.body!.length); assert.equal(f.calls.length, 4);
   }
 });
 
@@ -192,10 +202,10 @@ test('malformed cues identify the failing index and a fixed field without exposi
   ];
   for (const example of examples) {
     const f = fixture(); t.after(() => f.client.dispose()); const url = await discover(f); f.queue.push(json({ body: [cue, example.value] }));
-    await assert.rejects(f.client.subtitle(url, {}), errorCode('malformed_response'));
+    await assert.rejects(f.client.subtitle(url, { cookie: COOKIE }), errorCode('malformed_response'));
     const event = only(f, 'subtitle_body', 'parse', example.reason);
     assert.equal(event.field, example.field); assert.equal(event.actualType, example.actualType);
-    assert.equal(event.itemIndex, 1); assert.equal(event.itemCount, 2); assert.equal(f.calls.length, 2);
+    assert.equal(event.itemIndex, 1); assert.equal(event.itemCount, 2); assert.equal(f.calls.length, 4);
   }
 });
 
@@ -205,9 +215,9 @@ test('cue and text limits retain too_large and report only bounded count diagnos
     [Array.from({ length: 51 }, () => ({ ...cue, content: 'SECRET_TEXT_'.repeat(400).slice(0, 4000) })), 'text_limit'],
   ] as [unknown[], string][]) {
     const f = fixture(); t.after(() => f.client.dispose()); const url = await discover(f); f.queue.push(json({ body }));
-    await assert.rejects(f.client.subtitle(url, {}), errorCode('too_large'));
+    await assert.rejects(f.client.subtitle(url, { cookie: COOKIE }), errorCode('too_large'));
     const event = only(f, 'subtitle_body', 'parse', reason);
-    assert.equal(event.itemCount, body.length); assert.equal(event.errorCode, 'too_large'); assert.equal(f.calls.length, 2);
+    assert.equal(event.itemCount, body.length); assert.equal(event.errorCode, 'too_large'); assert.equal(f.calls.length, 4);
   }
 });
 
@@ -223,12 +233,12 @@ test('HTTP, API and transport failures carry the correct subtitle phase and rema
     const event = only(f, 'subtitle_tracks', failure.stage);
     if ('apiCode' in failure) assert.equal(event.apiCode, failure.apiCode);
     if ('status' in failure) assert.equal(event.httpStatus, failure.status);
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 3);
   }
   for (const response of [json({}, 503), new TransportError('cancelled', false)]) {
     const f = fixture(); t.after(() => f.client.dispose()); const url = await discover(f); f.queue.push(response);
-    await assert.rejects(f.client.subtitle(url, {}), errorCode(response instanceof Error ? 'cancelled' : 'access_blocked'));
-    only(f, 'subtitle_body', response instanceof Error ? 'transport' : 'http'); assert.equal(f.calls.length, 2);
+    await assert.rejects(f.client.subtitle(url, { cookie: COOKIE }), errorCode(response instanceof Error ? 'cancelled' : 'access_blocked'));
+    only(f, 'subtitle_body', response instanceof Error ? 'transport' : 'http'); assert.equal(f.calls.length, 4);
   }
 });
 
@@ -239,7 +249,7 @@ test('ordinary success, no tracks, login-limited empties and explicit AI Chinese
   }
   const f = fixture(); t.after(() => f.client.dispose()); const url = await discover(f); f.queue.push(json({ body: [cue] }));
   assert.deepEqual(await f.client.subtitle(url, { cookie: COOKIE }), [{ from: 0, to: 2, text: cue.content }]);
-  assert.equal(f.events.length, 0); assert.equal(f.calls.length, 2); assert.equal(f.calls[1].options.headers?.Cookie, undefined);
+  assert.equal(f.events.length, 0); assert.equal(f.calls.length, 4); assert.equal(f.calls.at(-1)!.options.headers?.Cookie, undefined);
 });
 
 test('throwing, rejecting and never-settling diagnostic sinks cannot change semantic failure or mixed success', async t => {
@@ -251,7 +261,7 @@ test('throwing, rejecting and never-settling diagnostic sinks cannot change sema
     assert.equal((await f.client.subtitles(BV, 456, {})).tracks.length, 1);
     f.queue.push(json({ body: [{ ...cue, to: -1 }] }));
     await assert.rejects(f.client.subtitle(subtitleUrl, {}), errorCode('malformed_response'));
-    assert.equal(f.calls.length, 3); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.calls.length, 5); await new Promise(resolve => setImmediate(resolve));
   }
 });
 
@@ -261,7 +271,7 @@ test('concurrent subtitle requests keep independent request IDs, phases and diag
   const bodyWait = new Promise<void>(resolve => { releaseBody = resolve; });
   let tracks = 0;
   const f = fixture(undefined, async url => {
-    if (new URL(url).pathname === '/x/player/v2') {
+    if (new URL(url).pathname === '/x/player/wbi/v2') {
       if (++tracks === 1) return json(player([track()]));
       await tracksWait; return json(player([track({ id_str: 'SECRET_BAD_ID' })]));
     }
@@ -276,5 +286,5 @@ test('concurrent subtitle requests keep independent request IDs, phases and diag
   assert.deepEqual(f.events.map(event => [event.phase, event.reason, event.hasSessionCookie]), [
     ['subtitle_body', 'invalid_cue_content', false], ['subtitle_tracks', 'track_rejected', true],
   ]);
-  privateSafe(f.events); assert.equal(f.calls.length, 3);
+  privateSafe(f.events); assert.equal(f.calls.length, 7);
 });

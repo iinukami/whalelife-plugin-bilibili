@@ -16,7 +16,7 @@ export interface RequestDiagnostic extends Partial<SubtitleDetails> {
   hasSessionCookie: boolean;
   elapsedMs: number;
   stage: 'http' | 'api' | 'transport' | 'response' | 'parse';
-  phase?: 'subtitle_tracks' | 'subtitle_body';
+  phase?: 'subtitle_prepare' | 'subtitle_tracks' | 'subtitle_body';
   responseBytes?: number;
   httpStatus?: number;
   apiCode?: number;
@@ -26,10 +26,11 @@ export type DiagnosticValueType = 'undefined' | 'null' | 'array' | 'object' | 's
 export interface SubtitleIssue {
   reason: 'invalid_json' | 'invalid_envelope' | 'invalid_data' | 'invalid_track_list' | 'invalid_track'
     | 'invalid_track_url' | 'invalid_track_id' | 'track_rejected' | 'invalid_cue_list' | 'invalid_cue'
-    | 'invalid_cue_time' | 'invalid_cue_content' | 'cue_limit' | 'text_limit' | 'invalid_response_url';
-  field: '$' | 'code' | 'data' | 'data.subtitle' | 'data.subtitle.subtitles' | 'track' | 'track.subtitle_url'
+    | 'invalid_cue_time' | 'invalid_cue_content' | 'cue_limit' | 'text_limit' | 'invalid_response_url' | 'identity_mismatch' | 'invalid_device_cookie' | 'invalid_wbi_keys';
+  field: '$' | 'code' | 'data' | 'data.bvid' | 'data.cid' | 'data.aid' | 'data.buvid' | 'data.wbi_img' | 'data.subtitle' | 'data.subtitle.subtitles' | 'track' | 'track.subtitle_url'
     | 'track.id' | 'track.id_str' | 'body' | 'cue' | 'cue.from' | 'cue.to' | 'cue.content' | 'response.url';
   actualType?: DiagnosticValueType;
+  urlProblem?: 'non_string' | 'empty' | 'invalid_url' | 'non_https' | 'credentials' | 'custom_port' | 'fragment' | 'whitespace' | 'too_long' | 'non_public_host';
   itemIndex?: number;
   constraint?: 'finite_number' | 'non_negative' | 'ordered' | 'string' | 'identifier' | 'trusted_url' | 'object' | 'array' | 'max_cues' | 'max_text';
 }
@@ -69,6 +70,7 @@ const apiPaths: Readonly<Record<string, string>> = Object.freeze({
   '/x/msgfeed/reply': 'reply_notifications',
   '/x/msgfeed/like': 'like_notifications',
   '/x/player/v2': 'subtitle_tracks',
+  '/x/player/wbi/v2': 'subtitle_tracks',
   '/x/player/playurl': 'play_url',
   '/x/web-interface/nav': 'account',
   '/x/web-interface/card': 'owner_profile',
@@ -107,9 +109,13 @@ function context(input: string, options: TransportOptions): RequestContext {
   const routes = host === 'api.bilibili.com' ? apiPaths : host === 'passport.bilibili.com' ? passportPaths : undefined;
   if (routes && Object.hasOwn(routes, path)) return { ...base, endpoint: routes[path],
     host: host as RequestDiagnostic['host'], path, json: true,
-    ...(host === 'api.bilibili.com' && path === '/x/player/v2' ? { phase: 'subtitle_tracks' as const } : {}),
+    ...(host === 'api.bilibili.com' && ['/x/player/v2', '/x/player/wbi/v2'].includes(path) ? { phase: 'subtitle_tracks' as const } : {}),
+    ...(host === 'api.bilibili.com' && path === '/x/web-frontend/getbuvid' && options.diagnosticPurpose === 'subtitle_cookie'
+      ? { endpoint: 'subtitle_cookie', phase: 'subtitle_prepare' as const } : {}),
+    ...(host === 'api.bilibili.com' && path === '/x/web-interface/nav' && options.diagnosticPurpose === 'subtitle_keys'
+      ? { endpoint: 'subtitle_keys', phase: 'subtitle_prepare' as const } : {}),
     searchKeys: host === 'api.bilibili.com' && path === '/x/web-interface/nav'
-      && options.diagnosticPurpose === 'search_keys' && !base.hasSessionCookie };
+      && ['search_keys', 'subtitle_keys'].includes(options.diagnosticPurpose ?? '') && !base.hasSessionCookie };
   if (host === 'api.bilibili.com' && path === '/x/v2/dm/web/seg.so') return { ...base, endpoint: 'danmaku' };
   if (host === 'www.bilibili.com' && path.startsWith('/correspond/1/')) return { ...base, endpoint: 'refresh_csrf' };
   if (host === 'b23.tv') return { ...base, endpoint: 'short_link' };
@@ -172,7 +178,7 @@ export function withDiagnostics(transport: Transport, sink?: DiagnosticSink): Tr
           const { json: _json, searchKeys: _searchKeys, ...fields } = request;
           const elapsedMs = Math.max(0, Math.round(performance.now() - started));
           const event: RequestDiagnostic = { requestId: randomUUID(), ...fields, elapsedMs,
-            ...(request.phase && httpStatus !== undefined ? { httpStatus } : {}),
+            ...(httpStatus !== undefined ? { httpStatus } : {}),
             ...(request.phase && responseBytes !== undefined ? { responseBytes } : {}), ...failure };
           // Do not await logging or let synchronous/asynchronous sink failures enter the business path.
           void Promise.resolve(sink(event)).catch(() => {});
@@ -181,9 +187,9 @@ export function withDiagnostics(transport: Transport, sink?: DiagnosticSink): Tr
       try {
         const response = await transport.request(input, options);
         try {
-          if (request?.phase) {
+          if (request) {
             if (Number.isInteger(response.status) && response.status >= 100 && response.status <= 599) httpStatus = response.status;
-            if (response.status >= 200 && response.status < 300 && Buffer.isBuffer(response.body)) responseBytes = response.body.length;
+            if (request.phase && response.status >= 200 && response.status < 300 && Buffer.isBuffer(response.body)) responseBytes = response.body.length;
             responseReports.set(response, report);
           }
         } catch { /* Keep the original response. */ }

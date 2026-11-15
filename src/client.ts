@@ -14,7 +14,7 @@ import { createTransport, safeUrl, TransportError } from './transport.ts';
 import { withDiagnostics, diagnosticType, reportSubtitleResponse } from './diagnostics.ts';
 import { readWbiKeys, signWbi, type WbiKeys } from './wbi.ts';
 import type { DiagnosticSink, SubtitleIssue } from './diagnostics.ts';
-import type { Transport, TransportResponse } from './transport.ts';
+import type { Transport, TransportResponse, TransportOptions } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
   SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, InteractionResult, CommentPublication, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
 
@@ -52,6 +52,21 @@ function bvid(value: unknown) { if (typeof value !== 'string' || !BV.test(value)
 function mediaUrl(value: unknown) {
   if (typeof value !== 'string') throw new BiliError('malformed_response');
   return safeUrl(value.startsWith('//') ? `https:${value}` : value.startsWith('http://') ? `https://${value.slice(7)}` : value).href;
+}
+function subtitleUrlProblem(value: unknown): SubtitleIssue['urlProblem'] {
+  if (typeof value !== 'string') return 'non_string';
+  if (!value) return 'empty';
+  if (value.length > 8192) return 'too_long';
+  if (/[\x00-\x20\x7f]/.test(value)) return 'whitespace';
+  const normalized = value.startsWith('//') ? 'https:' + value : value.startsWith('http://') ? 'https://' + value.slice(7) : value;
+  if (normalized.length > 8192) return 'too_long';
+  let url: URL;
+  try { url = new URL(normalized); } catch { return 'invalid_url'; }
+  if (url.protocol !== 'https:') return 'non_https';
+  if (url.username || url.password) return 'credentials';
+  if (url.port && url.port !== '443') return 'custom_port';
+  if (url.hash) return 'fragment';
+  try { safeUrl(normalized); } catch { return 'non_public_host'; }
 }
 function playableUrl(part: Record<string, any>): string {
   try { return mediaUrl(part.url); } catch (primaryError) {
@@ -175,7 +190,7 @@ function apiData(response: TransportResponse): Record<string, any> {
   return json.data == null ? {} : record(json.data);
 }
 
-interface SearchPreparation {
+interface WbiPreparation {
   identity: string;
   buvid?: string;
   keys?: { value: WbiKeys; expires: number };
@@ -188,9 +203,9 @@ export class BiliClient implements BiliClientContract {
   private aborter = new AbortController();
   private signal: AbortSignal;
   private knownImages = new Set<string>();
-  private knownSubtitles = new Set<string>();
+  private knownSubtitles = new Map<string, { cookie: string; referer: string; expires: number }>();
   private loginKeys = new Map<string, number>();
-  private searchPreparation?: SearchPreparation;
+  private wbiPreparation?: WbiPreparation;
   constructor(options: { transport?: Transport; signal?: AbortSignal; onDiagnostic?: DiagnosticSink } = {}) {
     this.transport = withDiagnostics(options.transport ?? createTransport(), options.onDiagnostic);
     this.signal = options.signal ? AbortSignal.any([options.signal, this.aborter.signal]) : this.aborter.signal;
@@ -214,20 +229,23 @@ export class BiliClient implements BiliClientContract {
   refreshCsrf(timestamp: number, options: CallOptions) { return getRefreshCsrf(this.transport, timestamp, { ...options, ...this.options(options) }); }
   renewCookies(token: string, csrf: string, options: CallOptions) { return renewCookies(this.transport, token, csrf, { ...options, ...this.options(options) }); }
   confirmRefresh(token: string, options: CallOptions) { return confirmRefresh(this.transport, token, { ...options, ...this.options(options) }); }
-  private async request(path: string, params: Record<string, string> | string, options: CallOptions, passport = false, diagnosticPurpose?: 'search_keys') {
+  private async request(path: string, params: Record<string, string> | string, options: CallOptions, passport = false, diagnosticPurpose?: TransportOptions['diagnosticPurpose'], referer = 'https://www.bilibili.com/') {
     const url = new URL(path, passport ? PASSPORT : API);
     url.search = typeof params === 'string' ? params : new URLSearchParams(params).toString();
     const cookie = checkedCookie(options.cookie);
     const response = await this.transport.request(url.href, { ...this.options(options), maxBytes: 2 * 1024 * 1024, ...(diagnosticPurpose ? { diagnosticPurpose } : {}),
-      headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate, br', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/', ...(cookie ? { Cookie: cookie } : {}) } });
-    try { if (safeUrl(response.url).hostname !== url.hostname) throw new BiliError('unsafe_url'); }
+      headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate, br', 'User-Agent': 'Mozilla/5.0', Referer: referer, ...(cookie ? { Cookie: cookie } : {}) } });
+    try {
+      const received = safeUrl(response.url);
+      if (received.hostname !== url.hostname || path === '/x/player/wbi/v2' && received.pathname !== path) throw new BiliError('unsafe_url');
+    }
     catch (error) {
-      if (path === '/x/player/v2') reportSubtitleResponse(response, { reason: 'invalid_response_url', field: 'response.url', constraint: 'trusted_url' }, 'unsafe_url');
+      if (path === '/x/player/wbi/v2' || diagnosticPurpose === 'subtitle_cookie' || diagnosticPurpose === 'subtitle_keys') reportSubtitleResponse(response, { reason: 'invalid_response_url', field: 'response.url', constraint: 'trusted_url' }, 'unsafe_url');
       throw error;
     }
     return response;
   }
-  private async waitSearchPreparation(pending: Promise<void>, options: CallOptions): Promise<void> {
+  private async waitWbiPreparation(pending: Promise<void>, options: CallOptions): Promise<void> {
     const { signal } = this.options(options);
     await new Promise<void>((resolve, reject) => {
       const cancelled = () => { cleanup(); reject(new BiliError(this.signal.aborted ? 'stopped' : 'cancelled')); };
@@ -238,13 +256,13 @@ export class BiliClient implements BiliClientContract {
     });
     this.options(options);
   }
-  private async prepareSearch(options: CallOptions): Promise<{ cookie: string; keys: WbiKeys }> {
+  private async prepareWbi(options: CallOptions, purpose: 'search' | 'subtitle' = 'search'): Promise<{ cookie: string; keys: WbiKeys }> {
     this.options(options);
     const identity = checkedCookie(options.cookie);
-    let state = this.searchPreparation;
+    let state = this.wbiPreparation;
     if (!state || state.identity !== identity) {
       state = { identity, pending: Promise.resolve() };
-      this.searchPreparation = state;
+      this.wbiPreparation = state;
     }
     // Serialize preparation only. A cancelled waiter never cancels another caller's work.
     const preceding = state.pending, observedFailure = state.failure;
@@ -253,27 +271,41 @@ export class BiliClient implements BiliClientContract {
     const ticket = new Promise<void>(resolve => { release = resolve; });
     state.pending = preceding.then(() => ticket);
     try {
-      await this.waitSearchPreparation(preceding, options);
+      await this.waitWbiPreparation(preceding, options);
       if (state.failure && state.failure !== observedFailure) throw state.failure.error;
       attempting = true;
       let cookie = identity;
       if (!cookieValue(cookie, 'buvid3')) {
         if (!state.buvid) {
-          const issued = apiData(await this.request('/x/web-frontend/getbuvid', {}, options));
+          const response = await this.request('/x/web-frontend/getbuvid', {}, options, false, purpose === 'subtitle' ? 'subtitle_cookie' : undefined);
           this.options(options);
-          if (typeof issued.buvid !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(issued.buvid)) throw new BiliError('malformed_response');
-          state.buvid = issued.buvid;
+          let issued: Record<string, any> | undefined;
+          try {
+            issued = apiData(response);
+            if (typeof issued.buvid !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(issued.buvid)) throw new BiliError('malformed_response');
+            state.buvid = issued.buvid;
+          } catch (error) {
+            if (purpose === 'subtitle') reportSubtitleResponse(response, { reason: 'invalid_device_cookie', field: 'data.buvid', actualType: diagnosticType(issued?.buvid) });
+            throw error;
+          }
         }
         cookie += (cookie ? '; ' : '') + 'buvid3=' + state.buvid;
       }
       if (!state.keys || state.keys.expires <= Date.now()) {
-        const response = await this.request('/x/web-interface/nav', {}, { ...options, cookie }, false, 'search_keys');
+        const response = await this.request('/x/web-interface/nav', {}, { ...options, cookie }, false, purpose === 'subtitle' ? 'subtitle_keys' : 'search_keys');
         this.options(options);
-        const json = parseJson(response);
-        // Public search can use the keys in an anonymous nav response without claiming login.
-        const data = json.code === -101 && !cookieValue(cookie, 'SESSDATA') ? record(json.data) : apiData(response);
-        const value = readWbiKeys(data.wbi_img);
-        state.keys = { value, expires: Date.now() + 5 * 60 * 1000 };
+        let material: unknown;
+        try {
+          const json = parseJson(response);
+          // Anonymous reads may use public signing keys without claiming login.
+          const data = json.code === -101 && !cookieValue(cookie, 'SESSDATA') ? record(json.data) : apiData(response);
+          material = data.wbi_img;
+          const value = readWbiKeys(material);
+          state.keys = { value, expires: Date.now() + 5 * 60 * 1000 };
+        } catch (error) {
+          if (purpose === 'subtitle') reportSubtitleResponse(response, { reason: 'invalid_wbi_keys', field: 'data.wbi_img', actualType: diagnosticType(material) });
+          throw error;
+        }
       }
       this.options(options);
       state.failure = undefined;
@@ -325,7 +357,7 @@ export class BiliClient implements BiliClientContract {
     pageNumber(page);
     if (typeof query !== 'string' || !query.trim() || query.length > 300 || /[\x00-\x1f\x7f]/.test(query)) throw new BiliError('invalid_input');
     try { encodeURIComponent(query); } catch { throw new BiliError('invalid_input'); }
-    const prepared = await this.prepareSearch(options);
+    const prepared = await this.prepareWbi(options);
     const params = signWbi({ search_type: 'video', keyword: query.trim(), page: String(page), page_size: '12' }, prepared.keys);
     const data = apiData(await this.request('/x/web-interface/wbi/search/type', params, { ...options, cookie: prepared.cookie }));
     this.options(options);
@@ -359,9 +391,15 @@ export class BiliClient implements BiliClientContract {
     }
     const params: Record<string, string> | undefined = BV.test(id) ? { bvid: id } : /^av\d+$/.test(id) ? { aid: String(integer(id.slice(2))) } : undefined;
     if (!params) throw new BiliError('invalid_input');
-    const data = apiData(await this.request('/x/web-interface/view', params, options));
+    const response = await this.request('/x/web-interface/view', params, options);
+    const data = apiData(response);
     const item = this.item(data);
     if (!item || !Array.isArray(data.pages) || !data.pages.length) throw new BiliError('malformed_response');
+    const field = BV.test(id) ? 'data.bvid' : 'data.aid';
+    if (BV.test(id) ? item.bvid !== id : String(item.aid) !== params.aid) {
+      reportSubtitleResponse(response, { reason: 'identity_mismatch', field, actualType: diagnosticType(BV.test(id) ? data.bvid : data.aid) });
+      throw new BiliError('malformed_response');
+    }
     try {
       const parts = data.pages.slice(0, 1000).map((part: any) => ({ cid: integer(part.cid), page: integer(part.page), title: plain(part.part, 500), duration: duration(part.duration) }));
       return { ...item, cid: integer(data.cid), description: plain(data.desc, 10000), parts,
@@ -439,7 +477,12 @@ export class BiliClient implements BiliClientContract {
   }
   async subtitles(id: string, cid: number, options: CallOptions): Promise<{ tracks: SubtitleTrack[]; loginRequired: boolean }> {
     bvid(id); integer(cid);
-    const response = await this.request('/x/player/v2', { bvid: id, cid: String(cid) }, options);
+    const prepared = await this.prepareWbi(options, 'subtitle');
+    this.options(options);
+    const referer = 'https://www.bilibili.com/video/' + id + '/';
+    const response = await this.request('/x/player/wbi/v2', signWbi({ bvid: id, cid: String(cid) }, prepared.keys),
+      { ...options, cookie: prepared.cookie }, false, undefined, referer);
+    this.options(options);
     let data: Record<string, any>;
     try { data = apiData(response); }
     catch (error) {
@@ -450,23 +493,36 @@ export class BiliClient implements BiliClientContract {
       throw error;
     }
     const source = data.subtitle?.subtitles;
-    if (data.subtitle != null && (typeof data.subtitle !== 'object' || Array.isArray(data.subtitle)))
+    if (data.subtitle != null && (typeof data.subtitle !== 'object' || Array.isArray(data.subtitle))) {
       reportSubtitleResponse(response, { reason: 'invalid_track_list', field: 'data.subtitle', actualType: diagnosticType(data.subtitle), constraint: 'object' });
+      throw new BiliError('malformed_response');
+    }
     if (source !== undefined && !Array.isArray(source)) {
       reportSubtitleResponse(response, { reason: 'invalid_track_list', field: 'data.subtitle.subtitles', actualType: diagnosticType(source), constraint: 'array' });
       throw new BiliError('malformed_response');
+    }
+    // Track URLs are usable only after the signed response identifies this exact video and part.
+    for (const field of ['bvid', 'cid'] as const) {
+      const value = data[field], required = Array.isArray(source) && source.length > 0;
+      const matches = field === 'bvid' ? value === id : value === cid || typeof value === 'string' && value === String(cid);
+      if ((required || value !== undefined) && !matches) {
+        reportSubtitleResponse(response, { reason: 'identity_mismatch', field: field === 'bvid' ? 'data.bvid' : 'data.cid', actualType: diagnosticType(value) });
+        throw new BiliError('malformed_response');
+      }
     }
     const tracks: SubtitleTrack[] = [], issues: SubtitleIssue[] = []; let rejected = 0;
     for (const [itemIndex, raw] of (source ?? []).slice(0, 30).entries()) {
       let issue: SubtitleIssue = { reason: 'invalid_track', field: 'track', actualType: diagnosticType(raw), itemIndex, constraint: 'object' };
       try {
         record(raw);
-        issue = { reason: 'invalid_track_url', field: 'track.subtitle_url', actualType: diagnosticType(raw.subtitle_url), itemIndex, constraint: 'trusted_url' };
+        issue = { reason: 'invalid_track_url', field: 'track.subtitle_url', actualType: diagnosticType(raw.subtitle_url), itemIndex, constraint: 'trusted_url', ...(subtitleUrlProblem(raw.subtitle_url) ? { urlProblem: subtitleUrlProblem(raw.subtitle_url) } : {}) };
         const url = mediaUrl(raw.subtitle_url);
         const rawId = raw.id_str ?? raw.id;
         issue = { reason: 'invalid_track_id', field: raw.id_str != null ? 'track.id_str' : 'track.id', actualType: diagnosticType(rawId), itemIndex, constraint: 'identifier' };
         const track = { id: identifier(rawId), language: plain(raw.lan, 40), label: plain(raw.lan_doc, 100), url };
-        this.remember(this.knownSubtitles, url); tracks.push(track);
+        if (this.knownSubtitles.size >= 1024) this.knownSubtitles.delete(this.knownSubtitles.keys().next().value!);
+        this.knownSubtitles.set(url, { cookie: checkedCookie(options.cookie), referer, expires: Date.now() + 60000 });
+        tracks.push(track);
       } catch { rejected++; if (issues.length < 5) issues.push(issue); }
     }
     if (rejected) reportSubtitleResponse(response, { reason: 'track_rejected', field: 'data.subtitle.subtitles',
@@ -475,9 +531,13 @@ export class BiliClient implements BiliClientContract {
     return { tracks, loginRequired: data.need_login_subtitle === true };
   }
   async subtitle(url: string, options: CallOptions): Promise<SubtitleCue[]> {
-    if (!this.knownSubtitles.has(url)) throw new BiliError('unsafe_url');
+    const source = this.knownSubtitles.get(url);
+    if (!source) throw new BiliError('unsafe_url');
+    if (source.cookie !== checkedCookie(options.cookie)) throw new BiliError('reference_unavailable');
+    if (source.expires <= Date.now()) { this.knownSubtitles.delete(url); throw new BiliError('reference_unavailable'); }
     const response = await this.transport.request(url, { ...this.options(options), maxBytes: 2 * 1024 * 1024, diagnosticPurpose: 'subtitle_body',
-      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' } });
+      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Referer: source.referer } });
+    this.options(options);
     const json = parseJson(response);
     if (!Array.isArray(json.body)) {
       reportSubtitleResponse(response, { reason: 'invalid_cue_list', field: 'body', actualType: diagnosticType(json.body), constraint: 'array' });
@@ -688,5 +748,5 @@ export class BiliClient implements BiliClientContract {
     }
     return { state: 'confirmed' };
   }
-  async dispose() { this.aborter.abort(); this.searchPreparation = undefined; this.knownImages.clear(); this.knownSubtitles.clear(); this.loginKeys.clear(); await this.transport.dispose(); }
+  async dispose() { this.aborter.abort(); this.wbiPreparation = undefined; this.knownImages.clear(); this.knownSubtitles.clear(); this.loginKeys.clear(); await this.transport.dispose(); }
 }

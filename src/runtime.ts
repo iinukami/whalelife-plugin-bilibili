@@ -8,7 +8,7 @@ import { BiliError, object, safeError } from './errors.ts';
 import { HistorySync } from './history-sync.ts';
 import { QQSharing } from './qq-share.ts';
 import type { HistoryOutcome } from './history-sync.ts';
-import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, CommentPublication, Config, NotificationCursor, NotificationSource, NotificationTarget, OwnerProfile, PreparedMedia, QQVideoShareService, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
+import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, CommentPublication, Config, NotificationCursor, NotificationSource, NotificationTarget, OwnerProfile, PreparedMedia, QQVideoShareService, SurfService, SubtitleCue, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
 
 type WatchHistoryResult = HistoryOutcome
   | { state: 'skipped'; reason: 'history_disabled' | 'login_required' | 'permission_required' | 'sampling_unavailable' }
@@ -17,6 +17,10 @@ type OwnerSnapshot = { profile?: OwnerProfile; revision?: string };
 type Ref = { session: string; account: string; expires: number; video: VideoItem | VideoDetails; comment?: CommentItem };
 type NotificationPageRef = { session: string; account: string; expires: number; source: NotificationSource; cursor: NotificationCursor };
 type NotificationRef = { session: string; account: string; expires: number; videoTarget: string; target: NotificationTarget };
+type SubtitleSnapshot = { available: false; tracks: []; loginRequired: boolean }
+  | { available: true; tracks: { language: string; label: string }[]; language: string; cues: SubtitleCue[] };
+type SubtitleSnapshotRef = { session: string; account: string; videoRef: string; expires: number; result: Promise<SubtitleSnapshot> };
+type SubtitlePage = { part: number; language?: string; offset: number };
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
 // Retain historical coin records when saving the ledger; no current action creates or replays them.
 type LegacyCoinLedgerFields = { coinTargetHash?: string; coinTarget?: number; coinAmount?: number };
@@ -56,6 +60,7 @@ export class BiliRuntime {
   private refs = new Map<string, Ref>();
   private notificationPages = new Map<string, NotificationPageRef>();
   private notifications = new Map<string, NotificationRef>();
+  private subtitleSnapshots = new Map<string, SubtitleSnapshotRef>();
   private media = new Map<string, MediaRef>();
   private pendingMedia = new Map<string, Promise<MediaRef>>();
   private vision?: OptionalService<VisionService>;
@@ -132,6 +137,7 @@ export class BiliRuntime {
     for (const [id, ref] of this.refs) if (ref.expires <= this.now() || ref.account !== this.identity()) this.refs.delete(id);
     for (const [id, ref] of this.notificationPages) if (ref.expires <= this.now() || ref.account !== this.identity()) this.notificationPages.delete(id);
     for (const [id, ref] of this.notifications) if (ref.expires <= this.now() || ref.account !== this.identity()) this.notifications.delete(id);
+    for (const [key, snapshot] of this.subtitleSnapshots) if (snapshot.expires <= this.now() || snapshot.account !== this.identity() || !this.refs.has(snapshot.videoRef)) this.subtitleSnapshots.delete(key);
     for (const [id, ref] of this.media) if (ref.expires <= this.now() || ref.binding.signal.aborted || ref.account !== this.identity()) { this.media.delete(id); void this.release(ref); }
   }
   private async release(ref: MediaRef) {
@@ -250,9 +256,64 @@ export class BiliRuntime {
       this.guard(); if (signal.aborted) throw new BiliError('cancelled'); if (identity !== this.identity()) throw new BiliError('account_changed'); return result;
     } finally { this.active--; }
   }
+  private async subtitlePage(videoRef: unknown, page: SubtitlePage, id: string, identity: string, options: CallOptions) {
+    const ref = this.get(videoRef, id), reference = String(videoRef);
+    const check = () => { this.checkOperation(identity, options); this.get(reference, id); };
+    check();
+    const key = hash({ session: id, account: identity, videoRef: reference, part: page.part, language: page.language ?? null });
+    let snapshot = this.subtitleSnapshots.get(key);
+    if (!snapshot) {
+      // Reserve in-flight work as well as completed snapshots. Never evict a live
+      // snapshot and silently splice later pages into a different subtitle file.
+      if (this.subtitleSnapshots.size >= 8) throw new BiliError('busy');
+      const result = Promise.resolve().then(async (): Promise<SubtitleSnapshot> => {
+        check();
+        const callOptions = { ...options, assertCurrent: check };
+        let video: VideoDetails;
+        if ('parts' in ref.video) video = ref.video;
+        else {
+          const expected = { bvid: ref.video.bvid, aid: ref.video.aid };
+          video = await withSignal(this.client.video(expected.bvid, callOptions), options.signal); check();
+          if (video.bvid !== expected.bvid || video.aid !== expected.aid) throw new BiliError('malformed_response');
+          ref.video = video;
+        }
+        const part = video.parts.find(part => part.page === page.part); if (!part) throw new BiliError('invalid_input');
+        const found = await withSignal(this.client.subtitles(video.bvid, part.cid, callOptions), options.signal); check();
+        if (!found.tracks.length) return { available: false, tracks: [], loginRequired: found.loginRequired };
+        const selected = page.language !== undefined ? found.tracks.find(track => track.language === page.language)
+          : found.tracks.find(track => track.language === 'ai-zh') ?? found.tracks.find(track => track.language === 'zh-CN')
+            ?? found.tracks.find(track => /^zh/.test(track.language)) ?? found.tracks[0];
+        if (!selected) throw new BiliError('invalid_input');
+        const cues = await withSignal(this.client.subtitle(selected.url, callOptions), options.signal); check();
+        // Keep a bounded, independent copy with no signed URL or external fields.
+        if (cues.length > 10000) throw new BiliError('too_large');
+        let textLength = 0;
+        const copy = cues.map(cue => {
+          if (!cue || typeof cue.from !== 'number' || typeof cue.to !== 'number' || !Number.isFinite(cue.from) || !Number.isFinite(cue.to)
+            || cue.from < 0 || cue.to < cue.from || typeof cue.text !== 'string') throw new BiliError('malformed_response');
+          textLength += cue.text.length; if (textLength > 200000) throw new BiliError('too_large');
+          return { from: cue.from, to: cue.to, text: cue.text };
+        });
+        return { available: true, tracks: found.tracks.map(({ language, label }) => ({ language, label })), language: selected.language, cues: copy };
+      });
+      snapshot = { session: id, account: identity, videoRef: reference, expires: ref.expires, result };
+      this.subtitleSnapshots.set(key, snapshot);
+      const own = snapshot;
+      void result.catch(() => { if (this.subtitleSnapshots.get(key) === own) this.subtitleSnapshots.delete(key); });
+    }
+    const data = await withSignal(snapshot.result, options.signal); check();
+    if (!data.available) return { ...data, tracks: [], audioEnabled: this.options.config().audioEnabled, untrusted: true };
+    const count = 60;
+    return { available: true, tracks: data.tracks.map(track => ({ ...track })), language: data.language,
+      cues: data.cues.slice(page.offset, page.offset + count).map(cue => ({ ...cue })),
+      nextOffset: page.offset + count < data.cues.length ? page.offset + count : undefined, untrusted: true };
+  }
+
   async read(action: string, raw: unknown, session: ToolSession): Promise<TransientToolOutput> {
     try {
       const args = object(raw);
+      const subtitlePage: SubtitlePage | undefined = action === 'subtitles' ? { part: integer(args.part, 1),
+        language: args.language === undefined ? undefined : string(args.language, 40), offset: integer(args.offset, 0, 0, 100000) } : undefined;
       if (action === 'owner') {
         this.guard(); if (!session.id) throw new BiliError('session_required');
         if (session.signal?.aborted) throw new BiliError('cancelled');
@@ -291,6 +352,7 @@ export class BiliRuntime {
           const video = await this.client.video(string(args.target, 2000), options);
           return { ...video, cover: undefined, videoRef: this.put(id, identity, video), untrusted: true };
         }
+        if (subtitlePage) return this.subtitlePage(args.videoRef, subtitlePage, id, identity, options);
         const ref = this.get(args.videoRef, id);
         const video = 'parts' in ref.video ? ref.video : await this.client.video(ref.video.bvid, options);
         ref.video = video;
@@ -313,19 +375,6 @@ export class BiliRuntime {
         if (action === 'comments') {
           const result = await this.client.comments(video.aid, integer(args.page, 1), options);
           return { ...result, items: result.items.map(comment => ({ ...comment, commentRef: this.put(id, identity, video, comment) })), untrusted: true };
-        }
-        if (action === 'subtitles') {
-          const part = video.parts.find(p => p.page === integer(args.part, 1)); if (!part) throw new BiliError('invalid_input');
-          const found = await this.client.subtitles(video.bvid, part.cid, options);
-          const tracks = found.tracks;
-          if (!tracks.length) return { tracks: [], loginRequired: found.loginRequired, available: false, audioEnabled: this.options.config().audioEnabled, untrusted: true };
-          const requested = args.language === undefined ? undefined : string(args.language, 40);
-          const selected = requested ? tracks.find(track => track.language === requested) : tracks.find(track => /^zh/.test(track.language)) ?? tracks[0];
-          if (!selected) throw new BiliError('invalid_input');
-          const cues = await this.client.subtitle(selected.url, options);
-          const offset = integer(args.offset, 0, 0, 100000), count = 60;
-          return { available: true, tracks: tracks.map(({ language, label }) => ({ language, label })), language: selected.language,
-            cues: cues.slice(offset, offset + count), nextOffset: offset + count < cues.length ? offset + count : undefined, untrusted: true };
         }
         throw new BiliError('invalid_input');
       });
@@ -511,7 +560,7 @@ export class BiliRuntime {
     }
   }
   async dispose() {
-    this.controller.abort(); this.refs.clear(); this.notificationPages.clear(); this.notifications.clear(); this.history.dispose();
+    this.controller.abort(); this.refs.clear(); this.subtitleSnapshots.clear(); this.notificationPages.clear(); this.notifications.clear(); this.history.dispose();
     const offers = [...this.media.values()]; this.media.clear();
     this.pendingMedia.clear(); await Promise.allSettled(offers.map(x => this.release(x)));
     await this.client.dispose();

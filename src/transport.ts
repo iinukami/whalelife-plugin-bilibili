@@ -14,7 +14,7 @@ export interface TransportOptions {
   method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string;
   signal?: AbortSignal; timeoutMs: number; maxBytes: number;
   // Observer-only context; never sent as an HTTP header or query parameter.
-  diagnosticPurpose?: 'search_keys' | 'subtitle_body';
+  diagnosticPurpose?: 'search_keys' | 'subtitle_cookie' | 'subtitle_keys' | 'subtitle_body';
 }
 export interface TransportResponse { status: number; headers: Record<string, string | string[]>; body: Buffer; url: string }
 export interface Transport { request(url: string, options: TransportOptions): Promise<TransportResponse>; dispose(): void | Promise<void> }
