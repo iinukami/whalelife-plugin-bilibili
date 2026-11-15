@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.2.6，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.7，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -71,7 +71,11 @@ MP4 下载前先校验主地址；若不通过，只检查同一播放响应中�
 
 平台HTTP/JSON数据结构仅在本插件内适配，版本变化以明确错误报告。缺少宿主临时工具时停用浏览，缺少视觉只关闭观看。插件停止撤销入口并取消所属请求；已经确认的远端动作不伪装撤销、不自动重放。
 
-0.2.1 起，默认客户端通过公开 `ctx.logger.warn` 写“B 站请求失败”诊断，每次失败请求至多一条，沿用宿主日志级别与保留设置。字段为随机 `requestId`、固定 `endpoint`、`method`、初始请求携带非空 SESSDATA 的布尔值 `hasSessionCookie`、`elapsedMs`，以及 `stage`：`http` 为非2xx响应（含原 `httpStatus`），`api` 为已知 JSON 接口的非零数字业务码（含 `httpStatus/apiCode`），`transport` 为传输异常（仅固定安全 `errorCode`），`response` 为有界 JSON envelope 格式异常。固定 API 路径白名单可附 `host/path`；CDN、短链、续期动态路径及未知地址均不记录原主机或路径。HTTP 非2xx不扩大响应体读取；JSON观察最多2MiB，不解析媒体或弹幕二进制。二维码等待、已扫码、正常过期均不是失败诊断；`code:0` 后的具体业务data校验一般不属于本层诊断；0.2.2 起，搜索响应自有 `data.v_voucher` 字段时记录 `stage:response`、`errorCode:access_blocked` 和原 HTTP 状态，不保存该字段值。站点 Cookie 获取使用固定分类 `search_cookie`，新旧搜索路径均归类 `search`。只有明确用于匿名搜索取键、未带 SESSDATA、`code:-101`、`isLogin:false` 且带有效 WBI 键的导航响应不记失败；显式账号校验及已登录凭据失效仍保留诊断。取键用途标记仅供内部观察，不作为 HTTP 头或参数发送。
+0.2.1 起，默认客户端通过公开 `ctx.logger.warn` 写“B 站请求失败”诊断，每次失败请求至多一条，沿用宿主日志级别与保留设置。字段为随机 `requestId`、固定 `endpoint`、`method`、初始请求携带非空 SESSDATA 的布尔值 `hasSessionCookie`、`elapsedMs`，以及 `stage`：`http` 为非2xx响应（含原 `httpStatus`），`api` 为已知 JSON 接口的非零数字业务码（含 `httpStatus/apiCode`），`transport` 为传输异常（仅固定安全 `errorCode`），`response` 为有界 JSON envelope 格式异常。固定 API 路径白名单可附 `host/path`；CDN、短链、续期动态路径及未知地址均不记录原主机或路径。HTTP 非2xx不扩大响应体读取；JSON观察最多2MiB，不解析媒体或弹幕二进制。二维码等待、已扫码、正常过期均不是失败诊断；`code:0` 后的具体业务data校验除下述字幕覆盖外不属于本层诊断；0.2.2 起，搜索响应自有 `data.v_voucher` 字段时记录 `stage:response`、`errorCode:access_blocked` 和原 HTTP 状态，不保存该字段值。站点 Cookie 获取使用固定分类 `search_cookie`，新旧搜索路径均归类 `search`。只有明确用于匿名搜索取键、未带 SESSDATA、`code:-101`、`isLogin:false` 且带有效 WBI 键的导航响应不记失败；显式账号校验及已登录凭据失效仍保留诊断。取键用途标记仅供内部观察，不作为 HTTP 头或参数发送。
+
+0.2.7 起，字幕请求增加固定 `phase:subtitle_tracks|subtitle_body`；正文使用固定 `endpoint:subtitle_body`，不保留 CDN 主机或路径。HTTP/API/传输失败继续沿用原 stage；JSON 根结构或编码错误为 `response`，轨道/正文语义校验为 `parse`。语义诊断附固定枚举 `reason/field/actualType/constraint`，可附从0开始的 `itemIndex`、条目/检查/接受/丢弃数量及限制；2xx响应可附解压后字节数 `responseBytes`。这些字段只报告类型和数量，不记录字段实际值。
+
+轨道最多检查30条；坏轨道仍按原规则过滤，一次请求最多报告一条 `track_rejected` 汇总和前5条安全原因，即使另有有效轨道也留下诊断。正文覆盖 JSON、body数组、每条时间与文本类型、10000条和200000字符限制；缺少字幕、空列表、需登录的正常结果不记错误。响应上的同一报告器贯穿传输与解析，已记录HTTP/API/JSON错误时不再重复报告解析错误。请求前的非法参数、未发现的字幕引用、停止/取消和运行时选轨错误仍由原工具错误回执说明，不伪装成平台响应失败。
 
 诊断不含查询参数、请求体、响应正文、原始错误说明、异常栈、请求头、Cookie值、用户/视频标识或会话ID，不进入模型回执或经历。排查时按时间和接口对应宿主工具记录；请求编号只标识一条诊断，不作为跨系统追踪ID。携带Cookie不证明登录有效，错误码不证明平台内部风控策略。日志写入失败不改变原响应或异常、取消行为及POST是否已提交的判断；不新增请求、重试、后台监听或风控绕过。
 

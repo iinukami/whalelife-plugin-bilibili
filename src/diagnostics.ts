@@ -7,7 +7,7 @@ import { BiliError } from './errors.ts';
 import { readWbiKeys } from './wbi.ts';
 import type { Transport, TransportOptions, TransportResponse } from './transport.ts';
 
-export interface RequestDiagnostic {
+export interface RequestDiagnostic extends Partial<SubtitleDetails> {
   requestId: string;
   endpoint: string;
   host?: 'api.bilibili.com' | 'passport.bilibili.com';
@@ -15,10 +15,43 @@ export interface RequestDiagnostic {
   method: 'GET' | 'POST' | 'unknown';
   hasSessionCookie: boolean;
   elapsedMs: number;
-  stage: 'http' | 'api' | 'transport' | 'response';
+  stage: 'http' | 'api' | 'transport' | 'response' | 'parse';
+  phase?: 'subtitle_tracks' | 'subtitle_body';
+  responseBytes?: number;
   httpStatus?: number;
   apiCode?: number;
   errorCode?: string;
+}
+export type DiagnosticValueType = 'undefined' | 'null' | 'array' | 'object' | 'string' | 'boolean' | 'number' | 'non_finite_number' | 'unsafe_integer' | 'other';
+export interface SubtitleIssue {
+  reason: 'invalid_json' | 'invalid_envelope' | 'invalid_data' | 'invalid_track_list' | 'invalid_track'
+    | 'invalid_track_url' | 'invalid_track_id' | 'track_rejected' | 'invalid_cue_list' | 'invalid_cue'
+    | 'invalid_cue_time' | 'invalid_cue_content' | 'cue_limit' | 'text_limit' | 'invalid_response_url';
+  field: '$' | 'code' | 'data' | 'data.subtitle' | 'data.subtitle.subtitles' | 'track' | 'track.subtitle_url'
+    | 'track.id' | 'track.id_str' | 'body' | 'cue' | 'cue.from' | 'cue.to' | 'cue.content' | 'response.url';
+  actualType?: DiagnosticValueType;
+  itemIndex?: number;
+  constraint?: 'finite_number' | 'non_negative' | 'ordered' | 'string' | 'identifier' | 'trusted_url' | 'object' | 'array' | 'max_cues' | 'max_text';
+}
+export interface SubtitleDetails extends SubtitleIssue {
+  itemCount?: number;
+  examinedCount?: number;
+  acceptedCount?: number;
+  rejectedCount?: number;
+  limit?: number;
+  issues?: SubtitleIssue[];
+}
+export function diagnosticType(value: unknown): DiagnosticValueType {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'number') return !Number.isFinite(value) ? 'non_finite_number'
+    : Number.isInteger(value) && !Number.isSafeInteger(value) ? 'unsafe_integer' : 'number';
+  return ['undefined', 'object', 'string', 'boolean'].includes(typeof value) ? typeof value as DiagnosticValueType : 'other';
+}
+// Weak keys retain neither responses nor signed URLs after the caller releases them.
+const responseReports = new WeakMap<TransportResponse, (failure: Failure) => void>();
+export function reportSubtitleResponse(response: TransportResponse, details: SubtitleDetails, errorCode = 'malformed_response') {
+  try { responseReports.get(response)?.({ stage: 'parse', errorCode, ...details }); } catch { /* Observation cannot affect parsing. */ }
 }
 export type DiagnosticSink = (event: RequestDiagnostic) => void | Promise<void>;
 
@@ -58,8 +91,8 @@ const transportCodes = new Set(['invalid_input', 'network_error', 'timeout', 'ca
   'login_required', 'platform_error', 'unsupported_media', 'too_large', 'unsafe_url', 'malformed_response', 'uncertain']);
 const jsonLimit = 2 * 1024 * 1024;
 const ordinaryPollCodes = new Set([0, 86101, 86090, 86038]);
-type RequestContext = Pick<RequestDiagnostic, 'endpoint' | 'host' | 'path' | 'method' | 'hasSessionCookie'> & { json: boolean; searchKeys: boolean };
-type Failure = Pick<RequestDiagnostic, 'stage' | 'httpStatus' | 'apiCode' | 'errorCode'>;
+type RequestContext = Pick<RequestDiagnostic, 'endpoint' | 'host' | 'path' | 'method' | 'hasSessionCookie' | 'phase'> & { json: boolean; searchKeys: boolean };
+type Failure = Pick<RequestDiagnostic, 'stage' | 'httpStatus' | 'apiCode' | 'errorCode'> & Partial<SubtitleDetails>;
 
 function context(input: string, options: TransportOptions): RequestContext {
   let cookie = '';
@@ -67,12 +100,14 @@ function context(input: string, options: TransportOptions): RequestContext {
   const base: RequestContext = { endpoint: 'unknown', json: false, searchKeys: false,
     method: options.method === undefined || options.method === 'GET' ? 'GET' : options.method === 'POST' ? 'POST' : 'unknown',
     hasSessionCookie: typeof cookie === 'string' && /(?:^|;\s*)SESSDATA=[^;\s]+/.test(cookie) };
+  if (options.diagnosticPurpose === 'subtitle_body') return { ...base, endpoint: 'subtitle_body', phase: 'subtitle_body' };
   let url: URL;
   try { url = new URL(input); } catch { return base; }
   const host = url.hostname, path = url.pathname;
   const routes = host === 'api.bilibili.com' ? apiPaths : host === 'passport.bilibili.com' ? passportPaths : undefined;
   if (routes && Object.hasOwn(routes, path)) return { ...base, endpoint: routes[path],
     host: host as RequestDiagnostic['host'], path, json: true,
+    ...(host === 'api.bilibili.com' && path === '/x/player/v2' ? { phase: 'subtitle_tracks' as const } : {}),
     searchKeys: host === 'api.bilibili.com' && path === '/x/web-interface/nav'
       && options.diagnosticPurpose === 'search_keys' && !base.hasSessionCookie };
   if (host === 'api.bilibili.com' && path === '/x/v2/dm/web/seg.so') return { ...base, endpoint: 'danmaku' };
@@ -88,15 +123,18 @@ function observe(response: TransportResponse, request: RequestContext): Failure 
   const status = response.status;
   if (!Number.isInteger(status) || status < 100 || status > 599) return { stage: 'response', errorCode: 'malformed_response' };
   if (status < 200 || status >= 300) return { stage: 'http', httpStatus: status };
-  if (!request.json) return;
+  if (!request.json && request.phase !== 'subtitle_body') return;
+  const issue = (reason: SubtitleIssue['reason'], field: SubtitleIssue['field'], value?: unknown): Partial<SubtitleDetails> =>
+    request.phase ? { reason, field, actualType: diagnosticType(value) } : {};
   if (!Buffer.isBuffer(response.body)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response' };
-  if (response.body.length > jsonLimit) return { stage: 'response', httpStatus: status, errorCode: 'too_large' };
+  if (response.body.length > jsonLimit) return { stage: 'response', httpStatus: status, errorCode: 'too_large', ...(request.phase ? { reason: 'invalid_envelope' as const, field: '$' as const, limit: jsonLimit } : {}) };
   let value: unknown;
   try { value = JSON.parse(response.body.toString('utf8')); }
-  catch { return { stage: 'response', httpStatus: status, errorCode: 'malformed_response' }; }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response' };
+  catch { return { stage: 'response', httpStatus: status, errorCode: 'malformed_response', ...issue('invalid_json', '$') }; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response', ...issue('invalid_envelope', '$', value) };
+  if (request.phase === 'subtitle_body') return;
   const code = (value as { code?: unknown }).code;
-  if (!Number.isSafeInteger(code)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response' };
+  if (!Number.isSafeInteger(code)) return { stage: 'response', httpStatus: status, errorCode: 'malformed_response', ...issue('invalid_envelope', 'code', code) };
   if (code !== 0) {
     if (code === -101 && request.searchKeys) {
       try {
@@ -126,20 +164,29 @@ export function withDiagnostics(transport: Transport, sink?: DiagnosticSink): Tr
     async request(input, options) {
       let request: RequestContext | undefined, started = 0;
       try { started = performance.now(); request = context(input, options); } catch { /* Observation is optional. */ }
-      let reported = false;
+      let reported = false, httpStatus: number | undefined, responseBytes: number | undefined;
       const report = (failure: Failure) => {
         if (reported || !request) return;
         reported = true;
         try {
           const { json: _json, searchKeys: _searchKeys, ...fields } = request;
           const elapsedMs = Math.max(0, Math.round(performance.now() - started));
-          const event: RequestDiagnostic = { requestId: randomUUID(), ...fields, elapsedMs, ...failure };
+          const event: RequestDiagnostic = { requestId: randomUUID(), ...fields, elapsedMs,
+            ...(request.phase && httpStatus !== undefined ? { httpStatus } : {}),
+            ...(request.phase && responseBytes !== undefined ? { responseBytes } : {}), ...failure };
           // Do not await logging or let synchronous/asynchronous sink failures enter the business path.
           void Promise.resolve(sink(event)).catch(() => {});
         } catch { /* Diagnostics must not fail or replace the original operation. */ }
       };
       try {
         const response = await transport.request(input, options);
+        try {
+          if (request?.phase) {
+            if (Number.isInteger(response.status) && response.status >= 100 && response.status <= 599) httpStatus = response.status;
+            if (response.status >= 200 && response.status < 300 && Buffer.isBuffer(response.body)) responseBytes = response.body.length;
+            responseReports.set(response, report);
+          }
+        } catch { /* Keep the original response. */ }
         try { if (request) { const failure = observe(response, request); if (failure) report(failure); } } catch { /* Keep the original response. */ }
         return response;
       } catch (error) {

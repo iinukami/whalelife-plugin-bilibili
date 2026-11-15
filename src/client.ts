@@ -11,9 +11,9 @@ import { readDanmaku } from './danmaku-client.ts';
 import type { DanmakuInput } from './danmaku-client.ts';
 import { checkRefresh, getRefreshCsrf, renewCookies, confirmRefresh, refreshToken } from './refresh-client.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
-import { withDiagnostics } from './diagnostics.ts';
+import { withDiagnostics, diagnosticType, reportSubtitleResponse } from './diagnostics.ts';
 import { readWbiKeys, signWbi, type WbiKeys } from './wbi.ts';
-import type { DiagnosticSink } from './diagnostics.ts';
+import type { DiagnosticSink, SubtitleIssue } from './diagnostics.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
   SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, InteractionResult, CommentPublication, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
@@ -220,7 +220,11 @@ export class BiliClient implements BiliClientContract {
     const cookie = checkedCookie(options.cookie);
     const response = await this.transport.request(url.href, { ...this.options(options), maxBytes: 2 * 1024 * 1024, ...(diagnosticPurpose ? { diagnosticPurpose } : {}),
       headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate, br', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/', ...(cookie ? { Cookie: cookie } : {}) } });
-    if (safeUrl(response.url).hostname !== url.hostname) throw new BiliError('unsafe_url');
+    try { if (safeUrl(response.url).hostname !== url.hostname) throw new BiliError('unsafe_url'); }
+    catch (error) {
+      if (path === '/x/player/v2') reportSubtitleResponse(response, { reason: 'invalid_response_url', field: 'response.url', constraint: 'trusted_url' }, 'unsafe_url');
+      throw error;
+    }
     return response;
   }
   private async waitSearchPreparation(pending: Promise<void>, options: CallOptions): Promise<void> {
@@ -435,30 +439,68 @@ export class BiliClient implements BiliClientContract {
   }
   async subtitles(id: string, cid: number, options: CallOptions): Promise<{ tracks: SubtitleTrack[]; loginRequired: boolean }> {
     bvid(id); integer(cid);
-    const data = apiData(await this.request('/x/player/v2', { bvid: id, cid: String(cid) }, options));
+    const response = await this.request('/x/player/v2', { bvid: id, cid: String(cid) }, options);
+    let data: Record<string, any>;
+    try { data = apiData(response); }
+    catch (error) {
+      // HTTP/API/JSON failures already have a diagnostic; the response reporter suppresses duplicates.
+      let value: unknown;
+      try { if (response.status >= 200 && response.status < 300 && response.body.length <= 2 * 1024 * 1024) value = JSON.parse(response.body.toString('utf8'))?.data; } catch { /* No raw response is logged. */ }
+      reportSubtitleResponse(response, { reason: 'invalid_data', field: 'data', actualType: diagnosticType(value), constraint: 'object' });
+      throw error;
+    }
     const source = data.subtitle?.subtitles;
-    if (source !== undefined && !Array.isArray(source)) throw new BiliError('malformed_response');
-    const tracks = (source ?? []).slice(0, 30).flatMap((raw: any) => {
+    if (data.subtitle != null && (typeof data.subtitle !== 'object' || Array.isArray(data.subtitle)))
+      reportSubtitleResponse(response, { reason: 'invalid_track_list', field: 'data.subtitle', actualType: diagnosticType(data.subtitle), constraint: 'object' });
+    if (source !== undefined && !Array.isArray(source)) {
+      reportSubtitleResponse(response, { reason: 'invalid_track_list', field: 'data.subtitle.subtitles', actualType: diagnosticType(source), constraint: 'array' });
+      throw new BiliError('malformed_response');
+    }
+    const tracks: SubtitleTrack[] = [], issues: SubtitleIssue[] = []; let rejected = 0;
+    for (const [itemIndex, raw] of (source ?? []).slice(0, 30).entries()) {
+      let issue: SubtitleIssue = { reason: 'invalid_track', field: 'track', actualType: diagnosticType(raw), itemIndex, constraint: 'object' };
       try {
-        const url = mediaUrl(raw.subtitle_url); const track = { id: identifier(raw.id_str ?? raw.id), language: plain(raw.lan, 40), label: plain(raw.lan_doc, 100), url };
-        this.remember(this.knownSubtitles, url); return [track];
-      } catch { return []; }
-    });
+        record(raw);
+        issue = { reason: 'invalid_track_url', field: 'track.subtitle_url', actualType: diagnosticType(raw.subtitle_url), itemIndex, constraint: 'trusted_url' };
+        const url = mediaUrl(raw.subtitle_url);
+        const rawId = raw.id_str ?? raw.id;
+        issue = { reason: 'invalid_track_id', field: raw.id_str != null ? 'track.id_str' : 'track.id', actualType: diagnosticType(rawId), itemIndex, constraint: 'identifier' };
+        const track = { id: identifier(rawId), language: plain(raw.lan, 40), label: plain(raw.lan_doc, 100), url };
+        this.remember(this.knownSubtitles, url); tracks.push(track);
+      } catch { rejected++; if (issues.length < 5) issues.push(issue); }
+    }
+    if (rejected) reportSubtitleResponse(response, { reason: 'track_rejected', field: 'data.subtitle.subtitles',
+      itemCount: source.length, examinedCount: Math.min(30, source.length), acceptedCount: tracks.length, rejectedCount: rejected, issues });
     if (source?.length > 0 && !tracks.length) throw new BiliError('malformed_response');
     return { tracks, loginRequired: data.need_login_subtitle === true };
   }
   async subtitle(url: string, options: CallOptions): Promise<SubtitleCue[]> {
     if (!this.knownSubtitles.has(url)) throw new BiliError('unsafe_url');
-    const json = parseJson(await this.transport.request(url, { ...this.options(options), maxBytes: 2 * 1024 * 1024,
-      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' } }));
-    if (!Array.isArray(json.body)) throw new BiliError('malformed_response');
+    const response = await this.transport.request(url, { ...this.options(options), maxBytes: 2 * 1024 * 1024, diagnosticPurpose: 'subtitle_body',
+      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' } });
+    const json = parseJson(response);
+    if (!Array.isArray(json.body)) {
+      reportSubtitleResponse(response, { reason: 'invalid_cue_list', field: 'body', actualType: diagnosticType(json.body), constraint: 'array' });
+      throw new BiliError('malformed_response');
+    }
     const result: SubtitleCue[] = []; let total = 0;
-    for (const raw of json.body.slice(0, 10000)) {
-      if (!raw || typeof raw.from !== 'number' || typeof raw.to !== 'number' || !Number.isFinite(raw.from) || !Number.isFinite(raw.to) || raw.from < 0 || raw.to < raw.from || typeof raw.content !== 'string') throw new BiliError('malformed_response');
-      const text = plain(raw.content, 4000); total += text.length; if (total > 200000) throw new BiliError('too_large');
+    const fail = (issue: SubtitleIssue, errorCode: 'malformed_response' | 'too_large' = 'malformed_response', limit?: number): never => {
+      reportSubtitleResponse(response, { ...issue, itemCount: json.body.length, acceptedCount: result.length, ...(limit === undefined ? {} : { limit }) }, errorCode);
+      throw new BiliError(errorCode);
+    };
+    for (const [itemIndex, raw] of json.body.slice(0, 10000).entries()) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail({ reason: 'invalid_cue', field: 'cue', actualType: diagnosticType(raw), itemIndex, constraint: 'object' });
+      for (const field of ['from', 'to'] as const) if (typeof raw[field] !== 'number' || !Number.isFinite(raw[field]))
+        fail({ reason: 'invalid_cue_time', field: field === 'from' ? 'cue.from' : 'cue.to', actualType: diagnosticType(raw[field]), itemIndex, constraint: 'finite_number' });
+      if (raw.from < 0) fail({ reason: 'invalid_cue_time', field: 'cue.from', actualType: 'number', itemIndex, constraint: 'non_negative' });
+      if (raw.to < raw.from) fail({ reason: 'invalid_cue_time', field: 'cue.to', actualType: 'number', itemIndex, constraint: 'ordered' });
+      if (typeof raw.content !== 'string') fail({ reason: 'invalid_cue_content', field: 'cue.content', actualType: diagnosticType(raw.content), itemIndex, constraint: 'string' });
+      const text = plain(raw.content, 4000); total += text.length;
+      if (total > 200000) fail({ reason: 'text_limit', field: 'cue.content', itemIndex, constraint: 'max_text' }, 'too_large', 200000);
       result.push({ from: raw.from, to: raw.to, text });
     }
-    if (json.body.length > 10000) throw new BiliError('too_large'); return result;
+    if (json.body.length > 10000) fail({ reason: 'cue_limit', field: 'body', constraint: 'max_cues' }, 'too_large', 10000);
+    return result;
   }
   private async download(url: string, maxBytes: number, options: CallOptions, video = false) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024) throw new BiliError('invalid_input');
