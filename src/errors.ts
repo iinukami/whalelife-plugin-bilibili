@@ -5,6 +5,7 @@
 const messages: Record<string, string> = {
   invalid_input: '输入不符合要求。', network_error: 'B 站网络请求失败。', timeout: '请求超时。', cancelled: '操作已取消。', stopped: '插件已停止。',
   access_blocked: 'B 站要求验证或限制访问，请稍后人工检查。', login_required: '需要有效的 B 站登录。', platform_error: 'B 站拒绝了此次操作。',
+  media_download_rejected: '视频下载阶段收到 HTTP 567，服务器未接受本次视频下载请求。',
   unsupported_media: '此视频未提供当前支持的完整 MP4 媒体。', too_large: '媒体或响应超过本次读取上限。', unsafe_url: '来源地址未通过校验。',
   malformed_response: 'B 站响应不完整或结构已变化。', reference_unavailable: '引用已过期、不属于当前会话或账号已改变，请重新浏览。',
   host_required: '宿主缺少临时工具能力，无法安全提供浏览。', session_required: '缺少可信当前会话。', vision_unavailable: '视觉服务当前不可用。',

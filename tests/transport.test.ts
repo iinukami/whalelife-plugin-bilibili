@@ -137,3 +137,41 @@ test('dispose cancels active requests and permanently prevents new work', async 
   await assert.rejects(pending, errorCode('stopped')); await assert.rejects(f.transport.request('https://example.com/', options), errorCode('stopped'));
   assert.equal(f.calls.length, 1); assert.equal(f.calls[0].destroyed, true);
 });
+
+test('only exact full GET ranges are accepted and compression negotiation stays identity', async t => {
+  const f = fixture([{ status: 206, headers: { 'content-range': 'bytes 0-8/9' } }]); t.after(() => f.transport.dispose());
+  await f.transport.request('https://example.com/media', { ...options, headers: { Range: 'bytes=0-' } });
+  assert.equal(f.calls[0].options.headers.range, 'bytes=0-'); assert.equal(f.calls[0].options.headers['accept-encoding'], 'identity');
+  const blocked = fixture(); t.after(() => blocked.transport.dispose());
+  for (const range of ['bytes=1-', 'bytes=0-15', 'bytes=-16', 'bytes=0-,16-', 'bytes=0- ', 'Bytes=0-', 'bytes=00-'])
+    await assert.rejects(blocked.transport.request('https://example.com/media', { ...options, headers: { Range: range } }), errorCode('invalid_input'));
+  for (const headers of [{ Range: 'bytes=0-', range: 'bytes=0-' }, { Range: 'bytes=0-', 'Accept-Encoding': 'gzip' }] as Record<string, string>[])
+    await assert.rejects(blocked.transport.request('https://example.com/media', { ...options, headers }), errorCode('invalid_input'));
+  await assert.rejects(blocked.transport.request('https://api.bilibili.com/x/test', { ...options, method: 'POST', body: 'x=1', headers: { Range: 'bytes=0-' } }), errorCode('invalid_input'));
+  assert.deepEqual(blocked.dns, []); assert.equal(blocked.calls.length, 0);
+});
+
+test('range redirects preserve the range and revalidate TLS DNS and cookie boundaries', async t => {
+  const f = fixture([{ status: 302, headers: { location: 'https://cdn.example/media' } }, { status: 206, headers: { 'content-range': 'bytes 0-8/9' } }]);
+  t.after(() => f.transport.dispose());
+  await f.transport.request('https://api.bilibili.com/media', { ...options, headers: { Range: 'bytes=0-', Cookie: 'SESSDATA=synthetic' } });
+  assert.deepEqual(f.dns, ['api.bilibili.com', 'cdn.example']);
+  assert.equal(f.calls[0].options.headers.cookie, 'SESSDATA=synthetic'); assert.equal(f.calls[1].options.headers.cookie, undefined);
+  for (const call of f.calls) { assert.equal(call.options.headers.range, 'bytes=0-'); assert.equal(call.options.headers['accept-encoding'], 'identity'); assert.equal(call.options.servername, call.url.hostname); }
+  const blocked = fixture([{ status: 302, headers: { location: 'https://private.example/media' } }]); t.after(() => blocked.transport.dispose());
+  await assert.rejects(blocked.transport.request('https://example.com/media', { ...options, headers: { Range: 'bytes=0-' } }), errorCode('unsafe_url'));
+  assert.equal(blocked.calls.length, 1);
+});
+
+test('range responses cannot be decompressed and cancellation destroys an in-flight transfer', async t => {
+  for (const status of [200, 206]) for (const encoding of ['gzip', 'deflate', 'br']) {
+    const f = fixture([{ status, headers: { 'content-encoding': encoding }, body: gzipSync(Buffer.from('synthetic')) }]); t.after(() => f.transport.dispose());
+    await assert.rejects(f.transport.request('https://example.com/media', { ...options, headers: { Range: 'bytes=0-' } }), errorCode('unsupported_media'));
+    assert.equal(f.responses[0].destroyed, true); assert.equal(f.calls.length, 1);
+  }
+  const f = fixture([{ hold: true }]), controller = new AbortController(); t.after(() => f.transport.dispose());
+  const pending = f.transport.request('https://example.com/media', { ...options, headers: { Range: 'bytes=0-' }, signal: controller.signal });
+  await new Promise(resolve => setImmediate(resolve)); controller.abort('SYNTHETIC_PRIVATE_REASON');
+  await assert.rejects(pending, error => error instanceof BiliError && error.code === 'cancelled' && !error.message.includes('SYNTHETIC'));
+  assert.equal(f.responses[0].destroyed, true); assert.equal(f.calls[0].destroyed, true);
+});

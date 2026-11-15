@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.2.3，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.4，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -51,6 +51,8 @@ QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有�
 搜索采用 `/x/web-interface/wbi/search/type`。已有 Cookie 中的 `buvid3` 优先；缺少时从固定的 `/x/web-frontend/getbuvid` 读取服务器下发值。导航接口 `/x/web-interface/nav` 提供 WBI 键，匿名 `code:-101` 且带有效键仍可用于公开搜索，不当作登录成功。准备状态按当前完整登录 Cookie 隔离，只保留在客户端内存；签名键缓存5分钟，并发准备合并，各阶段检查取消、停止和当前账号代际；切换账号或注销后不再发出后续旧凭据请求。换凭据后的调用不复用旧身份的站点 Cookie。搜索返回 `v_voucher` 明确视为 `access_blocked`，不交出验证令牌、不自动重试或刷新设备值；本地账号文件不变。
 
 MP4 下载前先校验主地址；若不通过，只检查同一播放响应中前8个备用地址，选择首个通过相同校验的候选。所有候选仍受标准 HTTPS 端口、公网 DNS 和下载限额约束；开始下载后失败不会自动换地址重试，CDN 请求不附带账号 Cookie。
+
+0.2.4 起，仅视频下载首个请求携带 `Range: bytes=0-` 和 `Accept-Encoding: identity`，图片下载保持原有协议。传输层只允许GET使用这一固定Range值，拒绝重复Range字段和压缩的范围响应；仍逐跳校验HTTPS、公网DNS及下载限额。200必须不含Content-Range；206必须有单一`bytes 0-(N-1)/N`，N为正安全整数且不超过下载上限，实际正文长度必须为N，Content-Length若存在也须匹配。未知总长度、非零起点、截断、多范围和压缩响应均拒绝；保留播放接口声明大小及MP4 ftyp校验，不增加分片拼接。视频下载的HTTP567映射为`media_download_rejected`，固定说明指出视频下载阶段及567，不推断账号风控；安全日志仍保留原HTTP状态，不保存签名URL、Cookie或响应正文。
 
 平台HTTP/JSON数据结构仅在本插件内适配，版本变化以明确错误报告。缺少宿主临时工具时停用浏览，缺少视觉只关闭观看。插件停止撤销入口并取消所属请求；已经确认的远端动作不伪装撤销、不自动重放。
 

@@ -243,6 +243,8 @@ test('only official-discovered subtitles and images can be downloaded and never 
   f.json({ item: [item] }); await f.client.feed('recommended', 1, undefined, {});
   f.queue.push({ body: Buffer.from([255,216,255,0,0]) });
   assert.equal((await f.client.image('https://i0.hdslb.com/synthetic.jpg', 1024, { cookie: COOKIE })).mime, 'image/jpeg');
+  assert.equal(f.calls.at(-1)!.options.headers?.Range, undefined);
+  assert.equal(f.calls.at(-1)!.options.headers?.['Accept-Encoding'], undefined);
   assert.equal(f.calls.at(-1)?.options.headers?.Cookie, undefined);
 });
 
@@ -427,4 +429,15 @@ test('validation and cancellation do not dispatch requests, and dispose invalida
   await assert.rejects(f.client.interact({ action: 'reply', aid: 111, mid: 123, text: '合成', root: 'bad', parent: '1' }, { cookie: COOKIE }), errorCode('invalid_input'));
   assert.equal(f.calls.length, 0); await f.client.dispose(); assert.equal(f.disposed(), true);
   await assert.rejects(f.client.search('q', 1, {}), errorCode('stopped'));
+});
+
+test('image transfers remain without Range and reject 206 without adopting video-specific HTTP errors', async t => {
+  const f = fixture(); t.after(() => f.client.dispose());
+  f.json({ item: [item] }); await f.client.feed('recommended', 1, undefined, {});
+  f.queue.push({ status: 206, headers: { 'content-range': 'bytes 0-3/4' }, body: Buffer.from([255, 216, 255, 217]) });
+  await assert.rejects(f.client.image('https://i0.hdslb.com/synthetic.jpg', 1024, { cookie: COOKIE }), errorCode('unsupported_media'));
+  assert.equal(f.calls.at(-1)!.options.headers?.Range, undefined); assert.equal(f.calls.at(-1)!.options.headers?.Cookie, undefined);
+  f.queue.push({ status: 567 });
+  await assert.rejects(f.client.image('https://i0.hdslb.com/synthetic.jpg', 1024, {}), errorCode('platform_error'));
+  assert.equal(f.calls.length, 3);
 });

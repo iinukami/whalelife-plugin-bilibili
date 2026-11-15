@@ -62,9 +62,16 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
         const headers: Record<string, string> = {};
         for (const [key, value] of Object.entries(options.headers ?? {})) {
           const name = key.toLowerCase();
-          if (!['accept', 'accept-encoding', 'user-agent', 'referer', 'content-type', 'cookie'].includes(name)
+          if (!['accept', 'accept-encoding', 'user-agent', 'referer', 'content-type', 'cookie', 'range'].includes(name)
+            || name === 'range' && Object.hasOwn(headers, name)
             || typeof value !== 'string' || /[\r\n\x00]/.test(value) || value.length > 16384) throw new BiliError('invalid_input');
           headers[name] = value;
+        }
+        if (headers.range !== undefined) {
+          // Only the full representation from byte zero is supported; never multipart or arbitrary slices.
+          if (method !== 'GET' || headers.range !== 'bytes=0-'
+            || headers['accept-encoding'] !== undefined && headers['accept-encoding'] !== 'identity') throw new BiliError('invalid_input');
+          headers['accept-encoding'] = 'identity';
         }
         let url = safeUrl(input);
         if (headers.cookie && !COOKIE_HOSTS.has(url.hostname)) throw new BiliError('unsafe_url');
@@ -117,6 +124,7 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
                   const length = Number(response.headers['content-length']);
                   if (Number.isFinite(length) && length > options.maxBytes) throw new BiliError('too_large');
                   const encoding = String(response.headers['content-encoding'] ?? 'identity').toLowerCase().trim();
+                  if (headers.range !== undefined && encoding !== 'identity') throw new BiliError('unsupported_media');
                   if (!['identity', 'gzip', 'deflate', 'br'].includes(encoding)) throw new BiliError('malformed_response');
                   let wire = 0;
                   response.on('data', chunk => { wire += chunk.length; if (wire > options.maxBytes) fail(new BiliError('too_large')); });

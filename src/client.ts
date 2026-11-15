@@ -459,13 +459,36 @@ export class BiliClient implements BiliClientContract {
     }
     if (json.body.length > 10000) throw new BiliError('too_large'); return result;
   }
-  private async download(url: string, maxBytes: number, options: CallOptions) {
+  private async download(url: string, maxBytes: number, options: CallOptions, video = false) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024) throw new BiliError('invalid_input');
     const response = await this.transport.request(url, { ...this.options(options), maxBytes,
-      headers: { Accept: '*/*', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' } });
+      headers: { Accept: '*/*', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/',
+        ...(video ? { Range: 'bytes=0-', 'Accept-Encoding': 'identity' } : {}) } });
+    if (video && response.status === 567) throw new BiliError('media_download_rejected');
     if ([401, 403, 412, 429, 503].includes(response.status)) throw new BiliError('access_blocked');
-    if (response.status === 206 || response.headers['content-range'] !== undefined) throw new BiliError('unsupported_media');
-    if (response.status !== 200) throw new BiliError('platform_error');
+    if (!video) {
+      if (response.status === 206 || response.headers['content-range'] !== undefined) throw new BiliError('unsupported_media');
+      if (response.status !== 200) throw new BiliError('platform_error');
+    } else {
+      if (response.status !== 200 && response.status !== 206) throw new BiliError('platform_error');
+      const encoding = response.headers['content-encoding'], type = response.headers['content-type'];
+      if (encoding !== undefined && (typeof encoding !== 'string' || encoding.trim().toLowerCase() !== 'identity')
+        || type !== undefined && (typeof type !== 'string' || /^multipart\//i.test(type.trim()))) throw new BiliError('unsupported_media');
+      const range = response.headers['content-range'];
+      if (response.status === 200) {
+        if (range !== undefined) throw new BiliError('unsupported_media');
+      } else {
+        const match = typeof range === 'string' ? /^bytes 0-(0|[1-9]\d*)\/([1-9]\d*)$/.exec(range) : null;
+        if (!match) throw new BiliError('unsupported_media');
+        const end = Number(match[1]), total = Number(match[2]);
+        if (!Number.isSafeInteger(end) || !Number.isSafeInteger(total) || end !== total - 1) throw new BiliError('unsupported_media');
+        if (total > maxBytes) throw new BiliError('too_large');
+        if (response.body.length !== total) throw new BiliError('unsupported_media');
+      }
+      const length = response.headers['content-length'];
+      if (length !== undefined && (typeof length !== 'string' || !/^(0|[1-9]\d*)$/.test(length)
+        || !Number.isSafeInteger(Number(length)) || Number(length) !== response.body.length)) throw new BiliError('unsupported_media');
+    }
     if (response.body.length > maxBytes) throw new BiliError('too_large'); return response.body;
   }
   async media(id: string, cid: number, maxBytes: number, options: CallOptions): Promise<Media> {
@@ -475,7 +498,7 @@ export class BiliClient implements BiliClientContract {
     if (!Array.isArray(data.durl) || data.durl.length !== 1 || typeof data.format !== 'string' || !data.format.includes('mp4')) throw new BiliError('unsupported_media');
     const part = record(data.durl[0]);
     if (typeof part.size === 'number' && part.size > maxBytes) throw new BiliError('too_large');
-    const bytes = await this.download(playableUrl(part), maxBytes, options);
+    const bytes = await this.download(playableUrl(part), maxBytes, options, true);
     if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp'
       || Number.isSafeInteger(part.size) && part.size > 0 && bytes.length !== part.size) throw new BiliError('unsupported_media');
     return { bytes, mime: 'video/mp4' };
