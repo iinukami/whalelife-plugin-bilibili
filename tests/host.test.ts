@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { CURRENT_HOST, MINIMUM_HOST, RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_DANMAKU,
+import { CURRENT_HOST, HISTORY_HOST, MINIMUM_HOST, RAW_TITLE, RAW_DESCRIPTION, RAW_COMMENT, RAW_SUBTITLE, RAW_AUDIO, RAW_DANMAKU,
   RAW_NOTIFICATION_REPLY, RAW_NOTIFICATION_LIKE, RAW_THREAD_ROOT, RAW_THREAD_REPLY, PRIVATE_NOTIFICATION_CURSOR,
   PRIVATE_QUERY, ERROR_SECRET, PRIVATE_MEDIA_REF, SYNTHETIC_COOKIE, VIDEO_ID, VIDEO_URL, hostFixture, installVision, until, diskText } from './host-fixture.ts';
 
@@ -493,20 +493,23 @@ test('optional vision, no-audio default, native image blocks and recovery keep t
   await f.assertPrivate([videoRef]);
 });
 
-test('history sync is an independent full tool using actual frame proofs, with no implicit write from safe watch', deadline, async t => {
-  const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture'), refs: string[] = [];
+for (const baseline of [CURRENT_HOST, HISTORY_HOST]) {
+test('enabled history sync completes inside watch with permissions, frame evidence and compatible manual receipts on ' + baseline.slice(0, 7), deadline, async t => {
+  const f = await hostFixture(t, baseline), fixture = f.service('bilibili-test-fixture'), refs: string[] = [];
   const initial: any = await (await f.request(prefix + '/state')).json();
   assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
   await installVision(f); await until(() => f.names().includes('bilibili_watch'), 'watch was not registered');
   const opened = await f.call('bilibili_open', { target: VIDEO_ID }), videoRef = opened.result.data.videoRef; refs.push(videoRef);
-  const watch = async (fromSeconds = 0, toSeconds = 5) => {
-    const result = await f.call('bilibili_watch', { videoRef, fromSeconds, toSeconds });
+  const watch = async (fromSeconds = 0, toSeconds = 5, permission: 'full' | 'ask' = 'full') => {
+    const result = await f.app.tools.call('bilibili_watch', { videoRef, fromSeconds, toSeconds }, { id: f.sessionId, permission });
     assert.equal(result.ok, true); const metadata = JSON.parse(result.result[0].text);
     if (metadata.watchRef) refs.push(metadata.watchRef);
     return { result, metadata };
   };
   assert.equal(f.app.tools.entries.get('bilibili_watch').danger, 'safe');
-  assert.equal((await watch()).metadata.watchRef, undefined);
+  const disabled = await watch();
+  assert.equal(disabled.metadata.watchRef, undefined);
+  assert.deepEqual(disabled.metadata.historySync, { state: 'skipped', reason: 'history_disabled' });
   assert.equal((await f.call('bilibili_mark_history', { watchRef: 'bili_watch_forged', operationId: 'synthetic-history' })).result.error.code, 'history_disabled');
   const setHistory = async (enabled: boolean) => {
     const settings: any = await (await f.request(prefix + '/config')).json();
@@ -515,69 +518,85 @@ test('history sync is an independent full tool using actual frame proofs, with n
   await setHistory(true);
   const status = await f.service().status(); assert.equal(status.historySyncEnabled, true); assert.equal(status.audioEnabled, false);
   assert.equal(Object.values(status.interactions).every(value => value === false), true);
+  await f.call('bilibili_subtitles', { videoRef });
+  const restricted = await watch(0, 5, 'ask');
+  assert.equal(restricted.result.result[1].type, 'image', 'safe viewing is still available without write permission');
+  assert.deepEqual(restricted.metadata.historySync, { state: 'skipped', reason: 'permission_required' });
+  assert.equal((await fixture.stats()).calls.some((name: string) => name.startsWith('history:')), false,
+    'settings, subtitles and restricted viewing cannot read or submit platform history');
   const watched = await watch(); assert.equal(watched.result.result[1].type, 'image');
   assert.match(watched.metadata.watchRef, /^bili_watch_/);
   assert.equal(watched.metadata.images[0].frames[0].atSeconds, 1.25);
-  assert.equal((await fixture.stats()).calls.some((name: string) => name.startsWith('history:')), false,
-    'enabling history or returning a frame cannot read or submit platform history');
+  assert.equal(watched.metadata.historySync.state, 'verified');
+  assert.equal(watched.metadata.historySync.positionSeconds, 1, 'the requested end 5 seconds is not watched progress');
+  assert.equal(watched.metadata.historySync.experienceRecorded, true);
+  assert.deepEqual((await fixture.stats()).historyPosts, [{ aid: 12345, cid: 67890, positionSeconds: 1 }]);
+  await f.app.runtime.events.drain();
+  const recorded = f.events.filter((event: any) => event.name === 'bilibili_watch').at(-1);
+  assert.deepEqual(recorded.result.historySync, watched.metadata.historySync, 'the projected tool receipt retains the synchronization outcome');
+  const experiences = async () => (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((record: any) => record.origin?.action === 'history');
+  const saved = await experiences(); assert.equal(saved.length, 1);
+  assert.equal(saved[0].text, '在 B 站同步了一次视频采样位置，历史回读已确认。');
+  const repeated = await watch();
+  assert.equal(repeated.metadata.historySync.duplicate, true);
+  assert.equal((await fixture.stats()).historyPosts.length, 1); assert.equal((await experiences()).length, 1);
   const args = { watchRef: watched.metadata.watchRef, operationId: 'synthetic-history' };
   assert.equal((await f.app.tools.call('bilibili_mark_history', args, { id: f.sessionId, permission: 'ask' })).ok, false);
   const other = await f.app.sessions.create('Synthetic other history viewer');
   assert.equal((await f.call('bilibili_mark_history', args, other)).result.error.code, 'reference_unavailable');
-  assert.equal((await fixture.stats()).historyPosts.length, 0);
   const marked = await f.call('bilibili_mark_history', args);
-  assert.equal(marked.result.status, 'ok'); assert.equal(marked.result.data.state, 'verified');
-  assert.equal(marked.result.data.positionSeconds, 1, 'the requested end 5 seconds is not watched progress');
-  assert.equal(marked.result.data.experienceRecorded, true);
-  assert.deepEqual((await fixture.stats()).historyPosts, [{ aid: 12345, cid: 67890, positionSeconds: 1 }]);
-  const experiences = async () => (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((record: any) => record.origin?.action === 'history');
-  const saved = await experiences(); assert.equal(saved.length, 1);
-  assert.equal(saved[0].text, '在 B 站同步了一次视频采样位置，历史回读已确认。');
-  assert.equal((await f.call('bilibili_mark_history', args)).result.data.duplicate, true);
-  assert.equal((await fixture.stats()).historyPosts.length, 1); assert.equal((await experiences()).length, 1);
+  assert.equal(marked.result.data.state, 'verified'); assert.equal(marked.result.data.duplicate, true);
+  assert.equal((await fixture.stats()).historyPosts.length, 1, 'the compatible manual tool cannot repeat an automatic write');
   const later = await watch(5, 10);
+  assert.equal(later.metadata.historySync.positionSeconds, 6);
+  assert.equal((await fixture.stats()).historyPosts.length, 2);
   await setHistory(false); await setHistory(true);
   assert.equal((await f.call('bilibili_mark_history', { watchRef: later.metadata.watchRef, operationId: 'after-toggle' })).result.error.code, 'reference_unavailable');
   await f.service('vision').configure('empty');
-  assert.equal((await watch(5, 10)).metadata.watchRef, undefined, 'metadata without real image blocks cannot issue proof');
-  assert.equal((await fixture.stats()).historyPosts.length, 1);
+  const empty = await watch(5, 10);
+  assert.equal(empty.metadata.watchRef, undefined, 'metadata without real image blocks cannot issue proof');
+  assert.deepEqual(empty.metadata.historySync, { state: 'skipped', reason: 'sampling_unavailable' });
+  assert.equal((await fixture.stats()).historyPosts.length, 2);
   assert.equal((await f.service('vision').stats()).understands, 0);
-  assert.equal(f.requests.length, 0);
+  assert.equal(f.requests.length, 0, 'history synchronization must not invoke a model');
   const pluginData = await diskText(join(f.bilibili, 'data'));
   for (const marker of [...refs, RAW_TITLE, PRIVATE_MEDIA_REF, 'synthetic-history']) assert.ok(!pluginData.includes(marker));
   await f.assertPrivate(refs);
 });
 
-test('accepted or uncertain history outcomes survive the process boundary and plugin reload without repeated writes', deadline, async t => {
-  for (const scenario of ['history-readback-fail', 'history-uncertain']) {
-    const f = await hostFixture(t), fixture = f.service('bilibili-test-fixture');
+test('automatic history outcomes retain frames and survive reload without repeated writes or extra tools on ' + baseline.slice(0, 7), deadline, async t => {
+  for (const scenario of ['history-readback-fail', 'history-uncertain', 'history-rejected']) {
+    const f = await hostFixture(t, baseline), fixture = f.service('bilibili-test-fixture');
     const initial: any = await (await f.request(prefix + '/state')).json();
     assert.equal((await f.request(prefix + '/login/import', { revision: initial.account.revision, cookie: SYNTHETIC_COOKIE })).status, 200);
     const config: any = await (await f.request(prefix + '/config')).json();
     assert.equal((await f.request(prefix + '/config', { revision: config.revision, config: { ...config.config, historySyncEnabled: true } })).status, 200);
     await installVision(f); await until(() => f.names().includes('bilibili_watch'), 'watch was not registered');
-    const proof = async () => {
+    const watch = async () => {
       const videoRef = (await f.call('bilibili_open', { target: VIDEO_ID })).result.data.videoRef;
       const output = await f.call('bilibili_watch', { videoRef, fromSeconds: 0, toSeconds: 5 });
-      return JSON.parse(output.result[0].text).watchRef;
+      assert.equal(output.ok, true); assert.equal(output.result[1].type, 'image', 'history failures cannot discard prepared images');
+      return JSON.parse(output.result[0].text);
     };
-    await fixture.configure(scenario); const watchRef = await proof();
-    const expected = scenario === 'history-uncertain' ? 'uncertain' : 'accepted';
-    const args = { watchRef, operationId: 'synthetic-history-' + scenario };
-    const first = await f.call('bilibili_mark_history', args); assert.equal(first.result.data.state, expected);
-    assert.equal((await f.call('bilibili_mark_history', { ...args, operationId: args.operationId + '-duplicate' })).result.data.state, expected);
+    await fixture.configure(scenario);
+    const expected = scenario === 'history-uncertain' ? 'uncertain' : scenario === 'history-rejected' ? 'rejected' : 'accepted';
+    const first = await watch(); assert.equal(first.historySync.state, expected);
+    const second = await watch(); assert.equal(second.historySync.state, expected); assert.equal(second.historySync.duplicate, true);
     assert.equal((await fixture.stats()).historyPosts.length, 1);
     const episodes = (await f.app.memoryEngine.inspect(f.sessionId)).items.filter((record: any) => record.origin?.action === 'history');
     assert.equal(episodes.length, 0, 'acceptance without matching history must not be remembered as verified');
     await f.app.runtime.action('surf/bilibili', 'reload');
     await until(() => f.names().includes('bilibili_watch'), 'watch did not recover after child reload');
-    const fresh = await proof();
-    const after = await f.call('bilibili_mark_history', { ...args, watchRef: fresh });
-    assert.equal(after.result.data.state, expected); assert.equal(after.result.data.duplicate, true);
+    const after = await watch();
+    assert.equal(after.historySync.state, expected); assert.equal(after.historySync.duplicate, true);
     assert.equal((await f.service('bilibili-test-fixture').stats()).historyPosts.length, 0);
-    assert.equal(f.requests.length, 0); await f.assertPrivate([watchRef, fresh, args.operationId]);
+    await f.app.runtime.events.drain();
+    assert.equal(f.events.some((event: any) => event.name === 'bilibili_mark_history'), false,
+      'the whole flow completes without a second tool invocation');
+    assert.equal(f.requests.length, 0); await f.assertPrivate([first.watchRef, second.watchRef, after.watchRef]);
   }
 });
+}
 
 test('parent stop cancels in-flight work; child independently stops and never replays on recovery', deadline, async t => {
   const f = await hostFixture(t), childPid = f.app.runtime.records.get('surf/bilibili').execution.pid;

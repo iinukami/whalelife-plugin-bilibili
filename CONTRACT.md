@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.2.2，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.3，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -14,8 +14,8 @@
 | bilibili_replies | notificationRef或commentRef二选一，可选page；回查目标及所属视频后返回根评论、目标评论与当前页子回复 |
 | bilibili_subtitles | videoRef、part、language、offset；默认第一P、优先中文，返回最多60条时间轴字幕及nextOffset |
 | bilibili_danmaku | videoRef、可选part/fromSeconds/toSeconds/offset；需danmakuEnabled，默认0–30秒、窗口最多60秒，100条一页 |
-| bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件及实际覆盖说明 |
-| bilibili_mark_history | watchRef、稳定operationId；需登录、historySyncEnabled与full权限，仅提交已有真实采样凭据对应的位置 |
+| bilibili_watch | videoRef、part、fromSeconds/toSeconds；默认30秒，单次最多60秒，返回真实画面附件、实际覆盖说明及historySync；启用且登录/full时同次自动同步位置 |
+| bilibili_mark_history | watchRef、稳定operationId；保留旧调用兼容，需登录、historySyncEnabled与full权限；正常watch已自动同步，无需补调 |
 | bilibili_interact | action仅限like/favorite/follow/comment/reply、operationId、videoRef或commentRef，以及评论/回复text；受独立开关、账号与full权限约束 |
 | bilibili_share_qq | videoRef、userId、operationId；需shareToQQEnabled、full权限及兼容QQ服务，按QQ设置以图文或小程序分享当前会话视频 |
 | bilibili_share_qq_delivery | userId、原operationId；查询同一可信会话的QQ发送回执，不发送；关闭开关或引用过期后仍可查 |
@@ -40,7 +40,9 @@ QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有�
 
 `bilibili_watch` 消费 vision 的公开 `offerMedia/prepare/understand/release`，仅内部保留媒体引用。声音关闭仅调 `prepare`；开启要求 audiovisualApiVersion 1.0.0 与 understand 存在，显式 `audio:['speech']`。不另选主模型、不将base64当普通JSON交给模型、不代为收藏或发送。采样与语音后端失败准确呈现，部分成功不冒充全片理解。
 
-`historySyncEnabled` 默认false，旧配置缺字段按false迁移。开启且登录时，watch 的真实JPEG、逐帧时间及覆盖范围通过校验才生成 `watchRef`；只认实际帧最大时间戳向下取整，必须小于分P时长，不接受模型自填进度。此引用证明采样准备结果，不证明主模型已理解。观看引用独立上限为每会话32/总128，TTL沿用配置；过期、账号变化、关闭开关、重载后失效。容量不足只省略watchRef，不影响观看。
+`historySyncEnabled` 默认false，旧配置缺字段按false迁移。开启且登录时，watch 的真实JPEG、逐帧时间及覆盖范围通过校验才生成 `watchRef`；只认实际帧最大时间戳向下取整，必须小于分P时长，不接受模型自填进度。此引用证明采样准备结果，不证明主模型已理解。观看引用独立上限为每会话32/总128，TTL沿用配置；过期、账号变化、关闭开关、重载后失效。容量不足只省略watchRef，不影响观看；自动同步返回sampling_unavailable。
+
+0.2.3 起，watch 在同一次调用中取得合格采样后自动执行历史同步，不调用模型、不启动另一次工具调用。仍要求当前可信会话full权限、已登录和historySyncEnabled；只读字幕、下载或无合格采样不提交。自动动作编号由已校验凭据的账号、会话、视频/分P及实际位置派生，不随重复观看或重载随机变化；原watchRef与手动工具保留兼容。metadata及安全持久回执同时包含historySync：实际执行时为HistoryOutcome；未执行时为`{state:"skipped",reason:"history_disabled"|"login_required"|"permission_required"|"sampling_unavailable"}`；同步前失败为`{state:"error",code}`。台账不可用返回persistence_error。同步单独失败仍返回已准备画面，取消/停用/换号则返回观看错误并保留已取得的同步结果，不返回旧身份画面。同步不能证明主模型已理解图片。
 
 历史写入使用独立持久记录和既有动作队列，先落pending再请求；同operationId改变内容拒绝，相同动作指纹防重，重启pending按uncertain处理。`accepted`仅表示接口接受；`verified`表示本次提交且历史回读位置不低于采样位置；`already_recorded`表示已有位置足够、没有提交；`rejected`是确定拒绝；`uncertain`不自动重发。只在submitted且verified后通过公开记忆接口写固定经历，补记失败不重发。近期历史查询限30条，缺席不证明没有旧记录；已知更高位置不回退，但不承诺发现更早历史或跨设备并发。POST只含aid/cid/progress/csrf，不发送观看心跳、播放时长或完成标记，不保证播放量。
 

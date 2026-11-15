@@ -56,7 +56,7 @@ export async function applyWithDependencies(ctx: Context, dependencies: Dependen
     ];
     for (const tool of tools) ctx.tools.registerTransient({ name: 'bilibili_' + tool.name, danger: 'safe', schema: tool.schema, description: tool.description, run: (args, session) => runtime.read(tool.name, args, session) });
     ctx.tools.registerTransient({ name: 'bilibili_mark_history', danger: 'full', schema: shape({ watchRef: text, operationId: text }, ['watchRef', 'operationId']),
-      description: '收到 bilibili_watch 的画面后，可用它返回的 watchRef 同步本次实际采样位置到 B 站历史。需用户开启独立历史同步开关、登录及 full 权限；只读字幕或下载不产生记录。位置由可信采样凭证确定，不能自报进度；这不是连续播放时长或完整观看。accepted 仅平台接受，verified 为历史回读确认，already_recorded 表示已有同等或更远进度而未新写。uncertain 不换ID重发；相同动作重试使用原 operationId。',
+      description: '兼容已有观看凭据的历史同步入口。开启历史同步后 bilibili_watch 已在同次调用内自动同步，无需再调用本工具；不得为自动同步失败或不确定结果换ID补发。需用户开启独立历史同步开关、登录及 full 权限；只读字幕或下载不产生记录。位置由可信采样凭证确定，不能自报进度；这不是连续播放时长或完整观看。accepted 仅平台接受，verified 为历史回读确认，already_recorded 表示已有同等或更远进度而未新写。uncertain 不换ID重发；相同动作重试使用原 operationId。',
       run: (args, session) => runtime.markHistory(args, session) });
     ctx.tools.registerTransient({ name: 'bilibili_interact', danger: 'full',
       schema: shape({ action: { type: 'string', enum: ['like', 'favorite', 'follow', 'comment', 'reply'] }, videoRef: text, commentRef: text, operationId: text, text }, ['action', 'operationId']),
@@ -67,7 +67,7 @@ export async function applyWithDependencies(ctx: Context, dependencies: Dependen
     runtime.setVision(binding); if (!binding) return;
     binding.effect(() => ctx.tools.registerMultimodal({ name: 'bilibili_watch', danger: 'safe',
       schema: shape({ videoRef: text, part: page, fromSeconds: { type: 'number', minimum: 0 }, toSeconds: { type: 'number', minimum: 0 } }, ['videoRef']),
-      description: '按片段观看 B 站普通视频，画面由视觉服务交给当前主模型。先用 bilibili_subtitles 读可用字幕；声音开关默认关闭，只有用户在设置中开启才会处理声音。默认30秒，单次最多60秒，以 coverage 报告实际采样范围；不能说已看完整视频。启用历史同步且取得真实画面时可返回 watchRef，收到画面后再按需调用 bilibili_mark_history；本工具本身不上报历史。媒体超过容量或平台验证会明确失败，不绕过付费/会员限制。',
+      description: '按片段观看 B 站普通视频，画面由视觉服务交给当前主模型。先用 bilibili_subtitles 读可用字幕；声音开关默认关闭，只有用户在设置中开启才会处理声音。默认30秒，单次最多60秒，以 coverage 报告实际采样范围；不能说已看完整视频。开启历史同步、已登录且有full权限时，取得有效采样画面后在本次调用内自动同步实际采样位置，historySync 返回同步结果，无需额外工具调用。同步失败仍返回已有画面，不要为同步失败重复观看或补发历史；只读字幕和下载不记历史。媒体超过容量或平台验证会明确失败，不绕过付费/会员限制。',
       run: (args, session) => runtime.watch(args, session) }));
   });
 

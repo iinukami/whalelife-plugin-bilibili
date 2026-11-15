@@ -121,6 +121,14 @@ export class HistorySync {
       expires: this.now() + Math.min(3600, Math.max(1, this.options.config().referenceTtlSeconds)) * 1000 });
     return ref;
   }
+  /** Stable across prepared references and restarts; only validated sampling evidence defines the position. */
+  automaticOperationId(watchRef: string, session: string, identity: string): string {
+    this.sweep();
+    const proof = this.proofs.get(watchRef), account = this.options.account();
+    if (!proof || !account || proof.session !== session || proof.identity !== identity || identity !== this.options.identity())
+      throw new BiliError('reference_unavailable');
+    return 'auto-watch:' + hash([account.mid, session, proof.aid, proof.cid, proof.positionSeconds]);
+  }
   private async save(required: boolean) {
     try { await this.options.saveLedger({ version: 1, entries: this.entries.map(e => ({ ...e })) }); }
     catch { this.initialized = false; if (required) throw new BiliError('persistence_error'); }
