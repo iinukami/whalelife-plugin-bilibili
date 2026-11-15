@@ -111,11 +111,12 @@ test('owner lookup diagnostics identify the public route without including UID, 
 test('comment and reply submit exactly one owner prefix with a numeric at_name_to_mid mapping', async t => {
   const f = fixture(t);
   for (const action of ['comment', 'reply'] as const) {
-    f.json({ reply: { rpid_str: '9007199254740993123' } });
+    f.json({ reply: { rpid_str: '9007199254740993123' } }); f.json({ root: null });
     const result = await f.client.interact({ ...COMMENT, action, mentionOwner: OWNER,
       ...(action === 'reply' ? { root: '9007199254740993121', parent: '9007199254740993122' } : {}) }, { cookie: COOKIE });
-    assert.deepEqual(result, { state: 'confirmed', platformId: '9007199254740993123' });
-    const call = f.calls.at(-1)!, fields = new URLSearchParams(call.options.body);
+    assert.deepEqual(result, { state: 'confirmed', platformId: '9007199254740993123',
+      comment: { visibility: 'not_public', checkedAnonymously: true, notification: 'unverified' } });
+    const call = f.calls.filter(item => item.options.method === 'POST').at(-1)!, fields = new URLSearchParams(call.options.body);
     assert.equal(call.url, 'https://api.bilibili.com/x/v2/reply/add'); assert.equal(call.options.method, 'POST');
     assert.equal(call.options.headers?.['Content-Type'], 'application/x-www-form-urlencoded');
     assert.equal(call.options.headers?.Cookie, COOKIE);
@@ -123,17 +124,17 @@ test('comment and reply submit exactly one owner prefix with a numeric at_name_t
     assert.deepEqual(JSON.parse(fields.get('at_name_to_mid')!), { 合成主人: 456 });
     assert.equal(fields.get('oid'), '111'); assert.equal(fields.get('type'), '1'); assert.equal(fields.get('plat'), '1');
     assert.equal(fields.get('csrf'), '0123456789abcdef0123456789abcdef');
-    assert.deepEqual([...fields.keys()].sort(), ['at_name_to_mid', 'csrf', 'message', 'oid', 'plat', 'type',
+    assert.deepEqual([...fields.keys()].sort(), ['at_name_to_mid', 'csrf', 'message', 'oid', 'plat', 'type', 'gaia_source', 'statistics',
       ...(action === 'reply' ? ['root', 'parent'] : [])].sort());
     if (action === 'reply') {
       assert.equal(fields.get('root'), '9007199254740993121'); assert.equal(fields.get('parent'), '9007199254740993122');
     }
   }
-  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls.length, 4); assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 2);
 });
 
 test('ordinary comments preserve their body without adding a mention mapping', async t => {
-  const f = fixture(t); f.json({ rpid_str: '1234' });
+  const f = fixture(t); f.json({ rpid_str: '1234' }); f.json({ root: null });
   await f.client.interact(COMMENT, { cookie: COOKIE });
   const fields = new URLSearchParams(f.calls[0].options.body);
   assert.equal(fields.get('message'), COMMENT.text); assert.equal(fields.has('at_name_to_mid'), false);
@@ -142,9 +143,9 @@ test('ordinary comments preserve their body without adding a mention mapping', a
 test('prototype-like owner names remain a single ordinary JSON key and UID values remain exact', async t => {
   const f = fixture(t);
   for (const name of ['__proto__', 'constructor', 'toString']) {
-    f.json({ rpid_str: '1234' });
+    f.json({ rpid_str: '1234' }); f.json({ root: null });
     await f.client.interact({ ...COMMENT, mentionOwner: { uid: String(Number.MAX_SAFE_INTEGER), name } }, { cookie: COOKIE });
-    const fields = new URLSearchParams(f.calls.at(-1)!.options.body), mapping = JSON.parse(fields.get('at_name_to_mid')!);
+    const fields = new URLSearchParams(f.calls.filter(call => call.options.method === 'POST').at(-1)!.options.body), mapping = JSON.parse(fields.get('at_name_to_mid')!);
     assert.equal(fields.get('message'), '@' + name + ' ' + COMMENT.text);
     assert.deepEqual(Object.keys(mapping), [name]); assert.equal(Object.hasOwn(mapping, name), true);
     assert.equal(mapping[name], Number.MAX_SAFE_INTEGER); assert.equal(typeof mapping[name], 'number');
@@ -177,11 +178,11 @@ test('only comments and replies accept an internally supplied owner and extra at
 test('the 1000-character limit includes the generated prefix and preserves Unicode code points', async t => {
   const f = fixture(t), owner = { uid: OWNER.uid, name: '合成😀' }, prefix = '@' + owner.name + ' ';
   const text = '😀'.repeat(1000 - [...prefix].length);
-  f.json({ rpid_str: '1234' }); await f.client.interact({ ...COMMENT, text, mentionOwner: owner }, { cookie: COOKIE });
+  f.json({ rpid_str: '1234' }); f.json({ root: null }); await f.client.interact({ ...COMMENT, text, mentionOwner: owner }, { cookie: COOKIE });
   const message = new URLSearchParams(f.calls[0].options.body).get('message')!;
   assert.equal(message, prefix + text); assert.equal([...message].length, 1000);
   await assert.rejects(f.client.interact({ ...COMMENT, text: text + '字', mentionOwner: owner }, { cookie: COOKIE }), errorCode('invalid_input'));
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.length, 2); assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 1);
 });
 
 test('ambiguous owner-mention submissions and platform rejections never retry automatically', async t => {

@@ -8,7 +8,7 @@ import { BiliError, object, safeError } from './errors.ts';
 import { HistorySync } from './history-sync.ts';
 import { QQSharing } from './qq-share.ts';
 import type { HistoryOutcome } from './history-sync.ts';
-import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, Config, NotificationCursor, NotificationSource, NotificationTarget, OwnerProfile, PreparedMedia, QQVideoShareService, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
+import type { AccountState, Action, BiliClientContract, CallOptions, CommentItem, CommentPublication, Config, NotificationCursor, NotificationSource, NotificationTarget, OwnerProfile, PreparedMedia, QQVideoShareService, SurfService, ThreadComment, VideoDetails, VideoItem, VisionService } from './types.ts';
 
 type WatchHistoryResult = HistoryOutcome
   | { state: 'skipped'; reason: 'history_disabled' | 'login_required' | 'permission_required' | 'sampling_unavailable' }
@@ -20,7 +20,7 @@ type NotificationRef = { session: string; account: string; expires: number; vide
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
 // Retain historical coin records when saving the ledger; no current action creates or replays them.
 type LegacyCoinLedgerFields = { coinTargetHash?: string; coinTarget?: number; coinAmount?: number };
-type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string } & LegacyCoinLedgerFields;
+type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string; comment?: CommentPublication } & LegacyCoinLedgerFields;
 export interface RuntimeOptions {
   signal: AbortSignal; transient: boolean; config: () => Config; account: () => AccountState | undefined; accountRevision?: () => string;
   readLedger: () => Promise<unknown>; saveLedger: (value: unknown) => Promise<void>; now?: () => number;
@@ -33,6 +33,24 @@ export interface RuntimeOptions {
 function string(value: unknown, max = 200) { if (typeof value !== 'string' || !value.trim() || value.length > max || /[\x00-\x08\x0b-\x1f\x7f]/.test(value)) throw new BiliError('invalid_input'); return value.trim(); }
 function integer(value: unknown, fallback: number, min = 1, max = 100) { if (value === undefined) return fallback; if (!Number.isInteger(value) || Number(value) < min || Number(value) > max) throw new BiliError('invalid_input'); return Number(value); }
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+function commentPublication(value: unknown): CommentPublication {
+  const unknown: CommentPublication = { visibility: 'unknown', checkedAnonymously: false, notification: 'unverified' };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return unknown;
+  const row = value as Record<string, unknown>;
+  if (typeof row.visibility !== 'string' || !['public', 'not_public', 'unknown'].includes(row.visibility) || typeof row.checkedAnonymously !== 'boolean'
+    || row.notification !== 'unverified' || row.state !== undefined && (!Number.isSafeInteger(row.state) || Number(row.state) < 0)) return unknown;
+  const visibility = row.visibility === 'public' && (!row.checkedAnonymously || row.state !== 0) ? 'unknown' : row.visibility as CommentPublication['visibility'];
+  return { visibility, ...(typeof row.state === 'number' ? { state: row.state } : {}), checkedAnonymously: row.checkedAnonymously, notification: 'unverified' };
+}
+function commentFields(value: unknown) {
+  const comment = commentPublication(value);
+  const visibility = comment.visibility === 'public' ? '已有匿名回读确认当时公开可见。'
+    : comment.visibility === 'not_public' ? '检查时未公开可见，可能处于审核或显示延迟，不能据此确定平台原因。'
+      : '尚未确认公开可见。';
+  return { comment, notice: 'confirmed 仅表示平台已接收评论或回复，不表示已经公开或通知已送达。' + visibility
+    + '可见性是已有检查结果，重复查询不会自动刷新；不要换 operationId 补发。' };
+}
 
 export class BiliRuntime {
   private refs = new Map<string, Ref>();
@@ -73,7 +91,8 @@ export class BiliRuntime {
         if (!/^[a-f0-9]{64}$/.test(String(e.key)) || !/^[a-f0-9]{64}$/.test(String(e.fingerprint)) || !['pending', 'confirmed', 'rejected', 'uncertain'].includes(String(e.state))) throw new BiliError('config_invalid');
         if (e.coinTargetHash !== undefined && (!/^[a-f0-9]{64}$/.test(String(e.coinTargetHash)) || ![1, 2].includes(Number(e.coinTarget))
           || !Number.isInteger(e.coinAmount) || Number(e.coinAmount) < 0 || Number(e.coinAmount) > 2)) throw new BiliError('config_invalid');
-        return { key: String(e.key), fingerprint: String(e.fingerprint), state: e.state as LedgerEntry['state'], ...(typeof e.platformId === 'string' && /^\d{1,30}$/.test(e.platformId) ? { platformId: e.platformId } : {}),
+        return { key: String(e.key), fingerprint: String(e.fingerprint), state: e.state as LedgerEntry['state'],
+          ...(e.comment !== undefined ? { comment: commentPublication(e.comment) } : {}), ...(typeof e.platformId === 'string' && /^\d{1,30}$/.test(e.platformId) ? { platformId: e.platformId } : {}),
           ...(e.coinTargetHash !== undefined ? { coinTargetHash: String(e.coinTargetHash), coinTarget: Number(e.coinTarget), coinAmount: Number(e.coinAmount) } : {}) };
       });
       this.ledgerReady = true;
@@ -403,13 +422,15 @@ export class BiliRuntime {
   }
   private async performInteraction(raw: unknown, session: ToolSession, owner?: OwnerSnapshot): Promise<TransientToolOutput> {
     let entry: LedgerEntry | undefined;
-    let submitted = false;
+    let submitted = false, isComment = false, duplicate = false;
+    let ledgerSaved: boolean | undefined, experienceRecorded: boolean | undefined;
     try {
       const args = object(raw), action = string(args.action) as Action;
       if (!['like', 'favorite', 'follow', 'comment', 'reply'].includes(action)
         || Object.keys(args).some(key => !['action', 'videoRef', 'commentRef', 'operationId', 'text', 'mentionOwner', 'sessionId'].includes(key))
         || args.mentionOwner !== undefined && typeof args.mentionOwner !== 'boolean'
         || args.mentionOwner === true && action !== 'comment' && action !== 'reply') throw new BiliError('invalid_input');
+      isComment = action === 'comment' || action === 'reply';
       const check = () => {
         if (!this.options.config().interactions[action]) throw new BiliError('interaction_disabled');
         if (session.permission !== 'full') throw new BiliError('permission_required');
@@ -420,7 +441,7 @@ export class BiliRuntime {
       if (text?.includes('@')) throw new BiliError('mention_invalid');
       // Legacy raw sessionId is tolerated but never used for references, routing or action keys.
       const mentionOwner = args.mentionOwner === true ? this.checkOwner(owner) : undefined;
-      const data = await this.operation(session, async (id, options) => {
+      const data = await this.operation(session, async (id, options, identity) => {
         check();
         if (!this.ledgerReady) throw new BiliError('persistence_error');
         const account = this.options.account(); if (!account) throw new BiliError('login_required');
@@ -436,8 +457,14 @@ export class BiliRuntime {
         const previous = this.ledger.find(e => e.key === key) ?? this.ledger.find(e => e.state !== 'rejected' && e.fingerprint === fingerprint);
         if (previous?.key === key && previous.fingerprint !== fingerprint) throw new BiliError('invalid_input');
         if (previous) {
-          if (previous.state === 'confirmed') await this.options.recordAction?.(id, previous.key, action).catch(() => {});
-          return { state: previous.state === 'pending' ? 'uncertain' : previous.state, duplicate: true, platformId: previous.platformId };
+          duplicate = true;
+          if (previous.state === 'confirmed') {
+            entry = previous;
+            if (isComment) previous.comment = commentPublication(previous.comment);
+            await this.options.recordAction?.(id, previous.key, action).catch(() => {});
+          }
+          return { state: previous.state === 'pending' ? 'uncertain' : previous.state, duplicate: true, platformId: previous.platformId,
+            ...(isComment && previous.state === 'confirmed' ? commentFields(previous.comment) : {}) };
         }
         if (this.ledger.length >= 4096) throw new BiliError('busy');
         const verified = await this.client.account(options); check();
@@ -452,20 +479,28 @@ export class BiliRuntime {
         if (this.identity() !== account.revision) throw new BiliError('account_changed');
         check();
         submitted = true;
-        const result = await this.client.interact({ action, aid: ref.video.aid, mid: ref.video.owner.mid, enabled: true, folderId, text,
+        const result = await this.client.interact({ action, aid: ref.video.aid, bvid: ref.video.bvid, mid: ref.video.owner.mid, enabled: true, folderId, text,
           ...(mentionOwner ? { mentionOwner: { ...mentionOwner } } : {}),
-          ...(ref.comment ? { parent: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root } : {}) }, options);
+          ...(ref.comment ? { parent: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root } : {}) },
+          { ...options, assertCurrent: () => { this.checkOperation(identity, options); check(); } });
         entry.state = 'confirmed'; entry.platformId = result.platformId;
-        let ledgerSaved = true;
+        if (isComment) entry.comment = commentPublication(result.comment);
+        ledgerSaved = true;
         try { await this.options.saveLedger({ entries: this.ledger }); } catch { this.ledgerReady = false; ledgerSaved = false; }
-        let experienceRecorded = false;
+        experienceRecorded = false;
         if (this.options.recordAction) { try { await this.options.recordAction(id, key, action); experienceRecorded = true; } catch { /* The action remains confirmed; never submit it again to repair memory. */ } }
-        return { ...result, ledgerSaved, experienceRecorded };
+        return { state: result.state, platformId: result.platformId, ...(isComment ? commentFields(entry.comment) : {}), ledgerSaved, experienceRecorded };
       });
-      return { content: { status: 'ok', data }, receipt: { action: 'bilibili_interact', state: data.state, duplicate: 'duplicate' in data ? data.duplicate : false } };
+      const publication = isComment && data.state === 'confirmed' ? commentFields('comment' in data ? data.comment : undefined) : {};
+      return { content: { status: 'ok', data }, receipt: { action: 'bilibili_interact', state: data.state, duplicate: 'duplicate' in data ? data.duplicate : false, ...publication } };
     } catch (error) {
       // A confirmed external result remains confirmed even if cancellation/account change occurred afterwards.
-      if (entry?.state === 'confirmed') return { content: { status: 'ok', data: { state: 'confirmed', platformId: entry.platformId } }, receipt: { action: 'bilibili_interact', state: 'confirmed' } };
+      if (entry?.state === 'confirmed') {
+        const publication = isComment ? commentFields(entry.comment) : {};
+        return { content: { status: 'ok', data: { state: 'confirmed', platformId: entry.platformId, ...(duplicate ? { duplicate: true } : {}),
+          ...(ledgerSaved !== undefined ? { ledgerSaved } : {}), ...(experienceRecorded !== undefined ? { experienceRecorded } : {}), ...publication } },
+          receipt: { action: 'bilibili_interact', state: 'confirmed', ...(duplicate ? { duplicate: true } : {}), ...publication } };
+      }
       const e = safeError(error);
       if (entry) {
         entry.state = !submitted || ['platform_error', 'login_required', 'access_blocked', 'invalid_input'].includes(e.code) ? 'rejected' : 'uncertain';

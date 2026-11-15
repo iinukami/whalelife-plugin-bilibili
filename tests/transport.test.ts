@@ -175,3 +175,39 @@ test('range responses cannot be decompressed and cancellation destroys an in-fli
   await assert.rejects(pending, error => error instanceof BiliError && error.code === 'cancelled' && !error.message.includes('SYNTHETIC'));
   assert.equal(f.responses[0].destroyed, true); assert.equal(f.calls[0].destroyed, true);
 });
+
+
+test('comment origin and CSRF headers are scoped to the exact POST endpoint and body token', async t => {
+  const csrf = '0123456789abcdef0123456789abcdef';
+  const f = fixture([{}]); t.after(() => f.transport.dispose());
+  await f.transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, method: 'POST', body: 'csrf=' + csrf,
+    headers: { Origin: 'https://www.bilibili.com', 'X-CSRF-Token': csrf } });
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].options.headers.origin, 'https://www.bilibili.com');
+  assert.equal(f.calls[0].options.headers['x-csrf-token'], csrf);
+  const bad = fixture(); t.after(() => bad.transport.dispose());
+  const headers = { Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf };
+  for (const url of ['https://cdn.example/x/v2/reply/add', 'https://www.bilibili.com/x/v2/reply/add',
+    'https://passport.bilibili.com/x/passport-login/web/cookie/refresh', 'https://api.bilibili.com/x/v2/reply/add/',
+    'https://api.bilibili.com/x/v2/reply/add?x=1', 'https://api.bilibili.com/x/web-interface/archive/like']) {
+    await assert.rejects(bad.transport.request(url, { ...options, method: 'POST', body: 'csrf=' + csrf, headers }),
+      error => error instanceof BiliError && ['invalid_input', 'unsafe_url'].includes(error.code));
+  }
+  await assert.rejects(bad.transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, headers }), errorCode('unsafe_url'));
+  for (const h of [{ ...headers, Origin: 'https://evil.example' }, { ...headers, Origin: 'https://www.bilibili.com/' },
+    { ...headers, origin: headers.Origin }, { ...headers, 'X-CSRF-Token': csrf }, { ...headers, 'x-csrf-token': 'short' },
+    { ...headers, 'x-csrf-token': 'x'.repeat(129) }, { ...headers, 'x-csrf-token': 'x'.repeat(15) + '=' }]) {
+    await assert.rejects(bad.transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, method: 'POST', body: 'csrf=' + csrf, headers: h }), errorCode('invalid_input'));
+  }
+  for (const body of ['csrf=' + 'a'.repeat(32), 'message=synthetic', 'csrf=' + csrf + '&csrf=' + csrf])
+    await assert.rejects(bad.transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, method: 'POST', body, headers }), errorCode('invalid_input'));
+  assert.equal(bad.calls.length, 0); assert.deepEqual(bad.dns, []);
+});
+
+test('comment credential headers never follow a redirect or cause a second submission', async t => {
+  const csrf = '0123456789abcdef0123456789abcdef';
+  const f = fixture([{ status: 302, headers: { location: 'https://cdn.example/redirected' } }]); t.after(() => f.transport.dispose());
+  await assert.rejects(f.transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, method: 'POST', body: 'csrf=' + csrf,
+    headers: { Cookie: 'SESSDATA=synthetic', Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf } }),
+    error => error instanceof TransportError && error.code === 'uncertain' && error.submitted);
+  assert.equal(f.calls.length, 1); assert.deepEqual(f.dns, ['api.bilibili.com']);
+});

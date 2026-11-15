@@ -421,7 +421,9 @@ test('enabled interactions require full permission, deduplicate submissions and 
   assert.equal(experience.outcome, 'succeeded');
   assert.equal(experience.origin.plugin, 'surf/bilibili');
   assert.equal(experience.origin.action, 'comment');
-  assert.equal(experience.text, '在 B 站完成发表评论，已取得平台确认。');
+  assert.equal(experience.text, '在 B 站提交评论并取得平台回执。此记录不确认公开可见或通知送达。');
+  assert.deepEqual(first.result.data.comment, { visibility: 'unknown', checkedAnonymously: false, notification: 'unverified' });
+  assert.match(first.result.data.notice, /仅表示平台已接收/);
   assert.equal((await experiences(other)).length, 0, 'model supplied sessionId cannot redirect the experience');
 
   for (const operationId of [args.operationId, 'synthetic-new-id-same-comment']) {

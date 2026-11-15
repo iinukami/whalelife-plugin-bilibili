@@ -32,7 +32,15 @@ export interface SubtitleCue { from: number; to: number; text: string }
 export interface Media { bytes: Buffer; mime: string }
 export type LoginPoll = { state: 'waiting' | 'scanned' | 'expired' } | { state: 'confirmed'; cookie: string; refreshToken?: string };
 export interface OwnerProfile { uid: string; name: string }
-export interface InteractionInput { mentionOwner?: OwnerProfile; action: Action; aid: number; mid: number; enabled?: boolean; folderId?: string; text?: string; root?: string; parent?: string }
+export interface CommentPublication {
+  visibility: 'public' | 'not_public' | 'unknown';
+  state?: number;
+  /** True only when an anonymous read returned valid evidence, not merely when a request was attempted. */
+  checkedAnonymously: boolean;
+  notification: 'unverified';
+}
+export interface InteractionResult { state: 'confirmed'; platformId?: string; comment?: CommentPublication }
+export interface InteractionInput { bvid?: string; mentionOwner?: OwnerProfile; action: Action; aid: number; mid: number; enabled?: boolean; folderId?: string; text?: string; root?: string; parent?: string }
 export interface BiliClientContract {
   ownerProfile(uid: string, options: CallOptions): Promise<OwnerProfile>;
   feed(source: 'recommended' | 'following', page: number, cursor: string | undefined, options: CallOptions): Promise<VideoList>;
@@ -57,7 +65,7 @@ export interface BiliClientContract {
   beginLogin(options: CallOptions): Promise<{ url: string; key: string }>;
   pollLogin(key: string, options: CallOptions): Promise<LoginPoll>;
   folders(mid: number, options: CallOptions): Promise<{ id: string; title: string }[]>;
-  interact(input: InteractionInput, options: CallOptions): Promise<{ state: 'confirmed'; platformId?: string }>;
+  interact(input: InteractionInput, options: CallOptions): Promise<InteractionResult>;
   dispose(): void | Promise<void>;
 }
 export interface SurfService { status(): unknown; settings(): { timeoutMs: number; concurrency: number; hasProxy: boolean }; search(input: { sessionId: string; query: string; limit?: number }, options?: { signal?: AbortSignal }): Promise<unknown> }

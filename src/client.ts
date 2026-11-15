@@ -16,7 +16,7 @@ import { readWbiKeys, signWbi, type WbiKeys } from './wbi.ts';
 import type { DiagnosticSink } from './diagnostics.ts';
 import type { Transport, TransportResponse } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
-  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
+  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, InteractionResult, CommentPublication, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
 
 const API = 'https://api.bilibili.com';
 const PASSPORT = 'https://passport.bilibili.com';
@@ -564,11 +564,42 @@ export class BiliClient implements BiliClientContract {
       return result;
     } catch { throw new BiliError('malformed_response'); }
   }
-  async interact(input: InteractionInput, options: CallOptions): Promise<{ state: 'confirmed'; platformId?: string }> {
+  private async commentPublication(input: InteractionInput, platformId: string, reply: unknown, options: CallOptions): Promise<CommentPublication> {
+    let result: CommentPublication = { visibility: 'unknown', checkedAnonymously: false, notification: 'unverified' };
+    // The POST receipt proves acceptance only. Its non-public flags are useful even if the later read fails.
+    try {
+      const row = record(reply);
+      if (responseId(row, 'rpid') !== platformId || row.type !== undefined && row.type !== 1
+        || (row.oid !== undefined || row.oid_str !== undefined) && integer(responseId(row, 'oid')) !== input.aid) throw new BiliError('malformed_response');
+      const state = typeof row.state === 'number' && Number.isSafeInteger(row.state) && row.state >= 0 ? row.state : undefined;
+      result = { ...result, ...(state !== undefined ? { state } : {}),
+        visibility: row.invisible === true || state !== undefined && state !== 0 ? 'not_public' : 'unknown' };
+    } catch { /* Missing or mismatched POST metadata cannot establish publication. */ }
+    try {
+      // One bounded, credential-free check within the original tool call; no polling or resubmission.
+      const response = await this.request('/x/v2/reply/detail', { type: '1', oid: String(input.aid), root: platformId },
+        { ...options, cookie: undefined, timeoutMs: Math.min(options.timeoutMs ?? 20000, 5000) });
+      this.options(options);
+      const json = parseJson(response);
+      if (json.code === 12006 || json.code === 0 && json.data?.root === null)
+        return { ...result, visibility: 'not_public', checkedAnonymously: true };
+      if (json.code !== 0) return result;
+      const row = record(record(json.data).root);
+      if (row.type !== 1 || integer(responseId(row, 'oid')) !== input.aid || responseId(row, 'rpid') !== platformId
+        || responseId(row, 'root', true) !== (input.action === 'reply' ? input.root : '0')
+        || responseId(row, 'parent', true) !== (input.action === 'reply' ? input.parent : '0')
+        || typeof row.state !== 'number' || !Number.isSafeInteger(row.state) || row.state < 0
+        || typeof row.invisible !== 'boolean') return result;
+      return { visibility: row.state === 0 && !row.invisible ? 'public' : 'not_public', state: row.state,
+        checkedAnonymously: true, notification: 'unverified' };
+    } catch { return result; } // Accepted comments stay accepted after read failure, cancellation or account change.
+  }
+  async interact(input: InteractionInput, options: CallOptions): Promise<InteractionResult> {
     if (!input || !['like', 'favorite', 'follow', 'comment', 'reply'].includes(input.action) || 'coinCount' in input) throw new BiliError('invalid_input');
-    if (Object.keys(input).some(key => !['action', 'aid', 'mid', 'enabled', 'folderId', 'text', 'root', 'parent', 'mentionOwner'].includes(key))) throw new BiliError('invalid_input');
+    if (Object.keys(input).some(key => !['action', 'aid', 'bvid', 'mid', 'enabled', 'folderId', 'text', 'root', 'parent', 'mentionOwner'].includes(key))) throw new BiliError('invalid_input');
     if (input.mentionOwner !== undefined && !['comment', 'reply'].includes(input.action)) throw new BiliError('invalid_input');
     integer(input.aid); integer(input.mid);
+    if (input.bvid !== undefined) bvid(input.bvid);
     if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new BiliError('invalid_input');
     const cookie = checkedCookie(options.cookie); const csrf = cookieValue(cookie, 'bili_jct');
     if (!cookie || !/^[A-Za-z0-9]{16,128}$/.test(csrf)) throw new BiliError('login_required');
@@ -589,14 +620,16 @@ export class BiliClient implements BiliClientContract {
         if ([...message].length > 1000) throw new BiliError('invalid_input');
         body.at_name_to_mid = JSON.stringify({ [owner.name]: Number(owner.uid) });
       }
-      Object.assign(body, { oid: String(input.aid), type: '1', message, plat: '1' });
+      Object.assign(body, { oid: String(input.aid), type: '1', message, plat: '1', gaia_source: 'main_web', statistics: JSON.stringify({ appId: 100, platform: 5 }) });
       if (input.action === 'reply') Object.assign(body, { root: identifier(input.root), parent: identifier(input.parent) });
     }
+    const comment = input.action === 'comment' || input.action === 'reply';
+    const referer = comment ? `https://www.bilibili.com/video/${input.bvid ?? 'av' + input.aid}/` : 'https://www.bilibili.com/';
     const call = this.options(options);
     let response: TransportResponse;
     try {
       response = await this.transport.request(API + path, { ...call, method: 'POST', body: new URLSearchParams(body).toString(), maxBytes: 1024 * 1024,
-        headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/', Cookie: cookie } });
+        headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', Referer: referer, Cookie: cookie, ...(comment ? { Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf } : {}) } });
     } catch (error) {
       if (error instanceof TransportError && !error.submitted) throw error;
       throw new BiliError('uncertain');
@@ -606,8 +639,10 @@ export class BiliClient implements BiliClientContract {
     if (typeof json.code !== 'number') throw new BiliError('uncertain');
     if (json.code !== 0) { apiData(response); throw new BiliError('platform_error'); }
     if (input.action === 'comment' || input.action === 'reply') {
-      try { const data = record(json.data); return { state: 'confirmed', platformId: identifier(data.rpid_str ?? data.rpid ?? data.reply?.rpid_str ?? data.reply?.rpid) }; }
+      let data: Record<string, any>, platformId: string;
+      try { data = record(json.data); platformId = identifier(data.rpid_str ?? data.rpid ?? data.reply?.rpid_str ?? data.reply?.rpid); }
       catch { throw new BiliError('uncertain'); }
+      return { state: 'confirmed', platformId, comment: await this.commentPublication(input, platformId, data.reply, options) };
     }
     return { state: 'confirmed' };
   }

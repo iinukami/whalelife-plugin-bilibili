@@ -374,14 +374,15 @@ test('five interactions encode bounded form data and explicit success while pres
   const f = fixture();
   for (const action of ['like', 'favorite', 'follow', 'comment', 'reply'] as const) {
     f.json(action === 'comment' || action === 'reply' ? { rpid_str: '9007199254740993123' } : {});
+    if (action === 'comment' || action === 'reply') f.json({ root: null });
     const result = await f.client.interact({ action, aid: 111, mid: 123, folderId: '456', text: '合成 & 内容=安全', root: '789', parent: '790' }, { cookie: COOKIE });
     assert.equal(result.state, 'confirmed');
-    const call = f.calls.at(-1)!; assert.equal(call.options.method, 'POST');
+    const call = f.calls.filter(item => item.options.method === 'POST').at(-1)!; assert.equal(call.options.method, 'POST');
     const fields = new URLSearchParams(call.options.body); assert.equal(fields.get('csrf'), '0123456789abcdef0123456789abcdef');
     if (action === 'comment' || action === 'reply') { assert.equal(fields.get('message'), '合成 & 内容=安全'); assert.equal(result.platformId, '9007199254740993123'); }
     if (action === 'reply') { assert.equal(fields.get('root'), '789'); assert.equal(fields.get('parent'), '790'); }
   }
-  assert.equal(f.calls.length, 5);
+  assert.equal(f.calls.length, 7); assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 5);
 });
 
 test('removed coin action and stale coinCount reject before transport dispatch', async t => {

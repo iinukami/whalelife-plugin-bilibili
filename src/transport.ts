@@ -62,8 +62,8 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
         const headers: Record<string, string> = {};
         for (const [key, value] of Object.entries(options.headers ?? {})) {
           const name = key.toLowerCase();
-          if (!['accept', 'accept-encoding', 'user-agent', 'referer', 'content-type', 'cookie', 'range'].includes(name)
-            || name === 'range' && Object.hasOwn(headers, name)
+          if (!['accept', 'accept-encoding', 'user-agent', 'referer', 'content-type', 'cookie', 'range', 'origin', 'x-csrf-token'].includes(name)
+            || ['range', 'origin', 'x-csrf-token'].includes(name) && Object.hasOwn(headers, name)
             || typeof value !== 'string' || /[\r\n\x00]/.test(value) || value.length > 16384) throw new BiliError('invalid_input');
           headers[name] = value;
         }
@@ -74,6 +74,17 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
           headers['accept-encoding'] = 'identity';
         }
         let url = safeUrl(input);
+        if (headers.origin !== undefined || headers['x-csrf-token'] !== undefined) {
+          // These additional write headers must never reach media hosts, redirects or unrelated APIs.
+          if (method !== 'POST' || url.hostname !== 'api.bilibili.com' || url.pathname !== '/x/v2/reply/add' || url.search)
+            throw new BiliError('unsafe_url');
+          if (headers.origin !== undefined && headers.origin !== 'https://www.bilibili.com') throw new BiliError('invalid_input');
+          if (headers['x-csrf-token'] !== undefined) {
+            const csrf = new URLSearchParams(options.body).getAll('csrf');
+            if (!/^[A-Za-z0-9]{16,128}$/.test(headers['x-csrf-token']) || csrf.length !== 1 || csrf[0] !== headers['x-csrf-token'])
+              throw new BiliError('invalid_input');
+          }
+        }
         if (headers.cookie && !COOKIE_HOSTS.has(url.hostname)) throw new BiliError('unsafe_url');
         const refreshPost = url.hostname === 'passport.bilibili.com' && !url.search
           && ['/x/passport-login/web/cookie/refresh', '/x/passport-login/web/confirm/refresh'].includes(url.pathname);

@@ -1,6 +1,6 @@
 # B 站子插件契约
 
-插件 0.2.5，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
+插件 0.2.6，manifest ID `bilibili`，运行 ID `surf/bilibili`。必需依赖 `surf`，可选依赖 `vision`、`qq`；不导入提供者实现、不读取提供者私有文件。公开 `bilibili.status()` 只返回能力、开关和忙碌状态，不提供凭据。
 
 模型工具以可信 `ToolSession.id` 固定本轮会话。模型自报 sessionId 无效，不能读取另一会话的引用。除了无外部资料的 `bilibili_status`，所有浏览和互动都是临时工具；观看是临时多模态工具。
 
@@ -23,6 +23,14 @@
 
 普通结果为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。不能用工具外层 `ok` 当作平台成功。互动结果明确 `confirmed|rejected|uncertain`，重复请求给 `duplicate:true`；pending重启记录视为uncertain，不发远端请求。稳定 operationId 及内容指纹共同防重发，记录中不保存评论正文或凭据。
 
+0.2.6 起，评论/回复的 `confirmed` 明确只表示平台接收并返回有效评论编号。结果、持久台账和安全回执增加 `comment:{visibility,state?,checkedAnonymously,notification}`：`visibility` 为 `public|not_public|unknown`；`state` 只保留平台返回的非负安全整数；`checkedAnonymously` 只在匿名请求取得有效证据时为true，不代表仅尝试过请求；`notification` 固定 `unverified`。`public` 必须是一次不带 Cookie/CSRF 的评论详情回读，其 type/oid/rpid/root/parent 全部对应本次目标且 state=0、invisible=false。12006、空root或有效的非正常状态只说明本次匿名查询不可见，不推断具体审核原因或永久失败。网络/限流/结构异常、取消或身份变化保留原提交及保守的 POST 状态；无明确证据时为unknown。旧台账缺字段或字段不合法时按未知读取，保留原防重数据。
+
+该回读在原工具调用内最多一次，额外请求限时不超过5秒，不轮询、不再调用模型。取得编号后，回读失败不得将动作改成可重发的拒绝；相同operationId或内容指纹继续阻止重新提交。重复调用返回原记录的可见性快照，不声称刚刚重新核验。结果附固定说明提醒平台接收、公开及通知送达不同；不增加通知送达查询的虚假保证。
+
+评论/回复 POST 的 Referer 从可信视频引用的BV号生成；内部旧调用未提供BV时使用对应av页，不能由模型指定任意来源URL。Origin固定为 `https://www.bilibili.com`，`x-csrf-token` 与正文唯一csrf值相同；两个新增头仅允许固定 `api.bilibili.com/x/v2/reply/add` 的无查询参数POST。沿用单次提交和不跟随POST重定向，其他平台请求及媒体下载不携带这两个头。正文保留现有 @ 映射，并补充网页端的gaia_source/statistics上下文。
+
+兼容依据包括 [bilibili-mcp 的独立 Referer 修复提交](https://github.com/nuko777/bilibili-mcp/commit/9c7f825b9602395da9e38d97c2f4e8e956c6cd1d) 与 [dafeiyu-hub 的评论实现](https://github.com/yuanstarstar/dafeiyu-hub/blob/9a26ca51e6c8c06f61ab21fea4c974656126693f/bridge/bili_bridge.py)。这些是维护者经验及公开实现，不足以证明单个请求头是任何账号隐藏评论的唯一原因，也不保证平台必定公开或发出通知。实现独立编写，未复制第三方代码。
+
 QQ 分享仅在 `ctx.optional('qq')` 绑定有效且 `videoShareApiVersion === '1.0.0'`、`sendVideoShare/videoShareDelivery` 均存在时注册临时工具。提供方契约见 QQ 插件的公开 `VIDEO-SHARING.md`（QQ 0.19.0 起）；本插件仅保留类型副本。`qqShareAvailable` 表示服务兼容且绑定有效，不代表QQ在线或收件人可发。旧QQ或旧宿主只缺此能力，不影响既有浏览；QQ停止撤销分享工具并取消在途调用，不重放。
 
 `shareToQQEnabled` 默认false；关闭会取消在途分享，查询仍可用。发送参数严格只接受videoRef/userId/operationId，查询只接受userId/operationId；sessionId、personaId、permission均来自可信工具会话。operationId为1–96位ASCII字母、数字、点、下划线、冒号或短横线，向QQ加 `bilibili:` 前缀。userId为5–20位非零开头数字字符串，QQ进一步核对好友白名单和非自身。发送由有效且同账号代际的视频引用取得标题、UP主、BV、aid及hdslb.com封面，构造 `pages/video/video?avid=<aid>` 与规范B站webUrl，不接受模型填写外部卡片字段。不做B站网络请求、登录续期、视频下载或统计上报。标题和封面属于外部资料，不构成发送授权。
@@ -33,11 +41,11 @@ QQ返回状态投影为sent/not_sent/uncertain/not_found，只有sent且具有�
 
 主人资料独立存于本插件 `data/owner.json`，仅含 `{owner:{uid,name}|null}`；`GET owner` 返回 owner（含派生主页 url）、revision、invalidStoredState，`POST owner` 只接受 uid 与 revision。UID 为空字符串表示清除，否则需规范正十进制安全整数（输入前后空格可去掉）。保存前用固定 `/x/web-interface/card?mid=...` 获取公开昵称并核对返回 UID，不接受浏览器或模型自填的姓名；只保存 UID 和原样有效昵称，不保存简介、统计、头像等扩展资料。登录 Cookie 可用于该查询但不复制入主人资料。加载不联网、重启保留；修改串行且检查 revision，获取或落盘失败保留旧设置。取消、换账号、停止会阻止尚未开始的保存；保存已开始且成功时以落盘结果为准，不假称回滚。坏文件不启用提及，用户可重新获取或清除。此资料不写主干人格、事实或聊天记忆。
 
-`bilibili_owner` 走临时工具，仅本地读取；公开 status 只增加 ownerConfigured 布尔值，不返回主人昵称或 UID。`bilibili_interact` 增加可选 `mentionOwner:boolean`，默认false。true时在调用入队捕获主人资料及代际，在等待、账号校验和pending落盘后直至提交前再次核对，改动或清除则报owner_changed；未设置报owner_required。模型不能指定UID、昵称或原始at映射；正文中的ASCII @ 会被拒绝并提示使用mentionOwner。实际POST的message为`@昵称 正文`，同时发送`at_name_to_mid={"昵称":数字UID}`，只有一个键；UID限制安全整数避免舍入，包含前缀的正文仍限1000字符。主人UID/昵称参与提及动作指纹；不提及的旧动作散列保持兼容。确认/不确定动作沿用持久防重语义，主人变化不会使旧动作自动重放。回执、经历、日志不含主人资料、原文或映射；平台确认只证明评论发表，不证明通知送达。回复他人本身的回复通知不属于额外@对象。
+`bilibili_owner` 走临时工具，仅本地读取；公开 status 只增加 ownerConfigured 布尔值，不返回主人昵称或 UID。`bilibili_interact` 增加可选 `mentionOwner:boolean`，默认false。true时在调用入队捕获主人资料及代际，在等待、账号校验和pending落盘后直至提交前再次核对，改动或清除则报owner_changed；未设置报owner_required。模型不能指定UID、昵称或原始at映射；正文中的ASCII @ 会被拒绝并提示使用mentionOwner。实际POST的message为`@昵称 正文`，同时发送`at_name_to_mid={"昵称":数字UID}`，只有一个键；UID限制安全整数避免舍入，包含前缀的正文仍限1000字符。主人UID/昵称参与提及动作指纹；不提及的旧动作散列保持兼容。确认/不确定动作沿用持久防重语义，主人变化不会使旧动作自动重放。回执、经历、日志不含主人资料、原文或映射；平台确认只证明接收评论，公开状态以comment字段为准，不能证明通知送达。回复他人本身的回复通知不属于额外@对象。
 
 协议依据为维护者的 [OpenCLI评论实现](https://github.com/jackwener/opencli/blob/main/clis/bilibili/comment.js) 及 [B站API收集项目的资料接口](https://github.com/bilibili-plugins/bilibili-api-collect/blob/master/docs/user/info.md)。这是社区维护的接口证据，不是B站官方稳定性保证；未复制第三方代码。
 
-确认的互动通过 `memory.recordExperience` 记录固定动作说明；事件标识使用动作散列，重复补记幂等。记忆失败只影响 `experienceRecorded`，不把已经完成的外部动作重新提交。
+确认的互动通过 `memory.recordExperience` 记录固定动作说明；评论/回复仅记已提交并取得平台回执，不记成已公开或通知送达；事件标识使用动作散列，重复补记幂等。记忆失败只影响 `experienceRecorded`，不把已经完成的外部动作重新提交。
 
 消息中心按需读取，不后台轮询、主动提交已读或发送互动；互动开关关闭时仍可读取。通知的用户、正文、原内容与来源均仅作临时资料；聚合点赞只返回平台提供的用户列表，不承诺全部点赞者。普通视频来源的 `videoTarget` 可用于既有 open 工具；有可靠定位信息的普通视频回复另返回 `notificationRef`。非视频、聚合点赞和定位不全的通知不生成评论入口。分页 cursor 和 notificationRef 为不透明内存引用，绑定可信会话、账号代际及 TTL，与视频/评论引用共享容量上限；不接收模型拼装的平台原始分页字段。
 
