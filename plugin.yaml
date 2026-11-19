@@ -1,6 +1,6 @@
 id: bilibili
 name: B 站
-version: 0.2.8
+version: 0.2.9
 description: 推荐、关注动态、搜索、消息与楼中楼、字幕与可选视听/弹幕，以及用户开启的历史同步、互动、QQ 视频分享和登录续期。
 apiVersion: "1.0.0"
 depends: [surf]

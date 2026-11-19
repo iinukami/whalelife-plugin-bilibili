@@ -15,8 +15,10 @@ const item = { bvid: BV, aid: 111, title: '<em>合成</em> &amp; 测试', owner:
 function fixture() {
   const calls: { url: string; options: TransportOptions }[] = [];
   const queue: (Partial<TransportResponse> | Error)[] = [];
-  let disposed = false;
-  const client = new BiliClient({ transport: {
+  let disposed = false, clock = 1700000000000;
+  const client = new BiliClient({ publicationNow: () => clock,
+    // Result-normalization tests keep a single read; bounded continuation has dedicated coverage.
+    publicationSleep: async () => { clock += 30001; }, transport: {
     async request(url, options) {
       calls.push({ url, options });
       const path = new URL(url).pathname;
@@ -382,7 +384,7 @@ test('five interactions encode bounded form data and explicit success while pres
     if (action === 'comment' || action === 'reply') { assert.equal(fields.get('message'), '合成 & 内容=安全'); assert.equal(result.platformId, '9007199254740993123'); }
     if (action === 'reply') { assert.equal(fields.get('root'), '789'); assert.equal(fields.get('parent'), '790'); }
   }
-  assert.equal(f.calls.length, 7); assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 5);
+  assert.equal(f.calls.length, 9); assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 5);
 });
 
 test('removed coin action and stale coinCount reject before transport dispatch', async t => {
@@ -409,7 +411,7 @@ test('uncertain mutations never retry; clear preflight failures and platform rej
   f.queue.push({ body: Buffer.from('<html>unknown</html>') }); await assert.rejects(f.client.interact(input, { cookie: COOKIE }), errorCode('uncertain'));
   f.json({}, -101); await assert.rejects(f.client.interact(input, { cookie: COOKIE }), errorCode('login_required'));
   f.json({}); await assert.rejects(f.client.interact({ ...input, action: 'comment', text: '合成' }, { cookie: COOKIE }), errorCode('uncertain'));
-  assert.equal(f.calls.length, 5);
+  assert.equal(f.calls.length, 7);
 });
 
 test('mutation code zero confirms state changes despite absent data but comments still require reliable IDs', async () => {
@@ -418,7 +420,7 @@ test('mutation code zero confirms state changes despite absent data but comments
     f.json(data); assert.deepEqual(await f.client.interact({ action: 'like', aid: 111, mid: 123 }, { cookie: COOKIE }), { state: 'confirmed' });
     f.json(data); await assert.rejects(f.client.interact({ action: 'comment', aid: 111, mid: 123, text: '合成' }, { cookie: COOKIE }), errorCode('uncertain'));
   }
-  assert.equal(f.calls.length, 8);
+  assert.equal(f.calls.length, 10);
 });
 
 test('validation and cancellation do not dispatch requests, and dispose invalidates media/login state', async () => {

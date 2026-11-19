@@ -23,13 +23,13 @@
 
 普通结果为 `{status:'ok',data}` 或 `{status:'error',error:{code,message}}`。不能用工具外层 `ok` 当作平台成功。互动结果明确 `confirmed|rejected|uncertain`，重复请求给 `duplicate:true`；pending重启记录视为uncertain，不发远端请求。稳定 operationId 及内容指纹共同防重发，记录中不保存评论正文或凭据。
 
-0.2.6 起，评论/回复的 `confirmed` 明确只表示平台接收并返回有效评论编号。结果、持久台账和安全回执增加 `comment:{visibility,state?,checkedAnonymously,notification}`：`visibility` 为 `public|not_public|unknown`；`state` 只保留平台返回的非负安全整数；`checkedAnonymously` 只在匿名请求取得有效证据时为true，不代表仅尝试过请求；`notification` 固定 `unverified`。`public` 必须是一次不带 Cookie/CSRF 的评论详情回读，其 type/oid/rpid/root/parent 全部对应本次目标且 state=0、invisible=false。12006、空root或有效的非正常状态只说明本次匿名查询不可见，不推断具体审核原因或永久失败。网络/限流/结构异常、取消或身份变化保留原提交及保守的 POST 状态；无明确证据时为unknown。旧台账缺字段或字段不合法时按未知读取，保留原防重数据。
+0.2.9 起，评论/回复的 confirmed 只证明平台接收并返回有效编号。comment 保留 visibility(public|not_public|unknown)、state?、checkedAnonymously、notification(unverified)，新增 postState?、postInvisible?、checkedAt(ISO)、attempts(0–2)、evidence(最多3项)。state只来自身份通过校验的回读，POST元数据单独存放；public须匿名回读 type/oid/rpid/root/parent 全部匹配且state=0/invisible=false；有效隐藏状态可not_public，12006或空root为unknown。evidence只含匿名/账号视角、固定结果枚举、HTTP/API码、安全错误码及state，不含正文。旧账本仍可读，不重放。
 
-该回读在原工具调用内最多一次，额外请求限时不超过5秒，不轮询、不再调用模型。取得编号后，回读失败不得将动作改成可重发的拒绝；相同operationId或内容指纹继续阻止重新提交。重复调用返回原记录的可见性快照，不声称刚刚重新核验。结果附固定说明提醒平台接收、公开及通知送达不同；不增加通知送达查询的虚假保证。
+回读在同一次工具调用内完成，总预算30秒、最多两轮匿名详情查询、每请求最多5秒，未查到或有效隐藏时等7.5秒再查；第二轮未查到再以登录态对照。平台限制、网络/结构错误或身份变化停止后续查询，不重发POST，也不调用模型。未确认公开的已接收操作再次调用时，距checkedAt至少30秒才只读刷新；已有public快照直接复用。取消或查询/保存失败仍保留confirmed，保存失败返回ledgerSaved:false。台账新增submittedAt和最小commentTarget(action/aid/root/parent)，不存标题、正文或Cookie；重复操作仍先核对原ID与内容指纹。
 
-评论/回复 POST 的 Referer 从可信视频引用的BV号生成；内部旧调用未提供BV时使用对应av页，不能由模型指定任意来源URL。Origin固定为 `https://www.bilibili.com`，`x-csrf-token` 与正文唯一csrf值相同；两个新增头仅允许固定 `api.bilibili.com/x/v2/reply/add` 的无查询参数POST。沿用单次提交和不跟随POST重定向，其他平台请求及媒体下载不携带这两个头。正文保留现有 @ 映射，并补充网页端的gaia_source/statistics上下文。
+评论/回复POST使用按原Cookie隔离的WBI准备，参数签名w_rid/wts放查询字符串，正文保持完整原值。Referer由可信BV/aid构造；Origin固定B站，x-csrf-token匹配唯一正文csrf。两个额外头只允许api.bilibili.com/x/v2/reply/add的POST，以及无查询或严格唯一w_rid(32位小写hex)/wts(1–13位非零开头数字)组合；未知/重复查询拒绝，POST不跟重定向。保留已验证的@映射、gaia_source/statistics，不允许模型设置任意请求头。准备/排队/保存后直至发送前重验账号、权限、开关及取消。
 
-兼容依据包括 [bilibili-mcp 的独立 Referer 修复提交](https://github.com/nuko777/bilibili-mcp/commit/9c7f825b9602395da9e38d97c2f4e8e956c6cd1d) 与 [dafeiyu-hub 的评论实现](https://github.com/yuanstarstar/dafeiyu-hub/blob/9a26ca51e6c8c06f61ab21fea4c974656126693f/bridge/bili_bridge.py)。这些是维护者经验及公开实现，不足以证明单个请求头是任何账号隐藏评论的唯一原因，也不保证平台必定公开或发出通知。实现独立编写，未复制第三方代码。
+兼容依据包括 [bilibili-mcp 的独立 Referer 修复提交](https://github.com/nuko777/bilibili-mcp/commit/9c7f825b9602395da9e38d97c2f4e8e956c6cd1d) 与 [dafeiyu-hub 的评论实现](https://github.com/yuanstarstar/dafeiyu-hub/blob/9a26ca51e6c8c06f61ab21fea4c974656126693f/bridge/bili_bridge.py)。这些是维护者经验及公开实现，不足以证明单个请求头是任何账号隐藏评论的唯一原因，也不保证平台必定公开或发出通知。实现独立编写，未复制第三方代码。 0.2.9 另外参考 [dsh-bili-whale 1.0.0固定提交](https://github.com/Alterssss/dsh-bili-whale/tree/27aa3180e12e54ff2e5627aeeca38d884fe891ce) 的请求保护、评论签名及有界回读；采用独立实现，保留本插件更严格的身份/状态校验，不照搬其测试期关闭间隔选项。
 
 QQ 分享仅在 `ctx.optional('qq')` 绑定有效且 `videoShareApiVersion === '1.0.0'`、`sendVideoShare/videoShareDelivery` 均存在时注册临时工具。提供方契约见 QQ 插件的公开 `VIDEO-SHARING.md`（QQ 0.19.0 起）；本插件仅保留类型副本。`qqShareAvailable` 表示服务兼容且绑定有效，不代表QQ在线或收件人可发。旧QQ或旧宿主只缺此能力，不影响既有浏览；QQ停止撤销分享工具并取消在途调用，不重放。
 
@@ -69,7 +69,7 @@ MP4 下载前先校验主地址；若不通过，只检查同一播放响应中�
 
 0.2.4 起，仅视频下载首个请求携带 `Range: bytes=0-` 和 `Accept-Encoding: identity`，图片下载保持原有协议。传输层只允许GET使用这一固定Range值，拒绝重复Range字段和压缩的范围响应；仍逐跳校验HTTPS、公网DNS及下载限额。200必须不含Content-Range；206必须有单一`bytes 0-(N-1)/N`，N为正安全整数且不超过下载上限，实际正文长度必须为N，Content-Length若存在也须匹配。未知总长度、非零起点、截断、多范围和压缩响应均拒绝；保留播放接口声明大小及MP4 ftyp校验，不增加分片拼接。视频下载的HTTP567映射为`media_download_rejected`，固定说明指出视频下载阶段及567，不推断账号风控；安全日志仍保留原HTTP状态，不保存签名URL、Cookie或响应正文。
 
-0.2.8 起，字幕只走 `/x/player/wbi/v2`：共享按Cookie隔离的WBI准备，必要时补取buvid3（只放内存）和签名键；有效键最多缓存5分钟，平台失败不回退旧字幕接口、不自动重试。API和CDN均使用可信BV构造的视频页Referer，CDN不带Cookie。完整授权URL不删改参数；仅已发现且同Cookie的URL可下载，本地来源上下文仅允许在60秒内使用，这是本地使用限制，不表示平台授权恰好有效60秒。未知地址拒绝；换账号或本地上下文过期报reference_unavailable。视频详情核对输入BV/aid；有轨道的签名响应必须回显匹配的bvid/cid，空结果若有身份字段也必须匹配；异常字幕容器明确报malformed_response。归属字段匹配仍不能独立证明字幕内容正确，不能据此宣称已理解视频。
+0.2.8 起，字幕只走 `/x/player/wbi/v2`：共享按Cookie隔离的WBI准备，必要时补取buvid3和签名键（0.2.9已登录账号的设备标识另行持久化）；有效键最多缓存5分钟，平台失败不回退旧字幕接口、不自动重试。API和CDN均使用可信BV构造的视频页Referer，CDN不带Cookie。完整授权URL不删改参数；仅已发现且同Cookie的URL可下载，本地来源上下文仅允许在60秒内使用，这是本地使用限制，不表示平台授权恰好有效60秒。未知地址拒绝；换账号或本地上下文过期报reference_unavailable。视频详情核对输入BV/aid；有轨道的签名响应必须回显匹配的bvid/cid，空结果若有身份字段也必须匹配；异常字幕容器明确报malformed_response。归属字段匹配仍不能独立证明字幕内容正确，不能据此宣称已理解视频。
 
 字幕快照按账号、可信会话、videoRef、分P及指定语言隔离，绑定原引用有效期；最多8份（包括在途），每份不超过10000条/200000字符，只存文字和时间轴，不存签名URL或额外字段。首次成功或无字幕结果固定到引用过期，续页及offset=0复用；重新open取得新引用可刷新。容量满报busy，不逐出有效快照导致续页换内容。取消等待者不影响创建者；创建者取消则同次等待均失败，不发布迟到结果，后续显式调用可重试。停止、换账号、引用过期均拒绝在途旧结果；所有快照不落盘、不进入经历或持久回执。字幕参数语法先校验，非法分页不发起账号准备或字幕请求。
 
@@ -81,10 +81,20 @@ MP4 下载前先校验主地址；若不通过，只检查同一播放响应中�
 
 轨道最多检查30条；坏轨道仍按原规则过滤，一次请求最多报告一条 `track_rejected` 汇总和前5条安全原因，即使另有有效轨道也留下诊断。正文覆盖 JSON、body数组、每条时间与文本类型、10000条和200000字符限制；缺少字幕、空列表、需登录的正常结果不记错误。响应上的同一报告器贯穿传输与解析，已记录HTTP/API/JSON错误时不再重复报告解析错误。请求前的非法参数、未发现的字幕引用、停止/取消和运行时选轨错误仍由原工具错误回执说明，不伪装成平台响应失败。
 
-诊断不含查询参数、请求体、响应正文、原始错误说明、异常栈、请求头、Cookie值、用户/视频标识或会话ID，不进入模型回执或经历。排查时按时间和接口对应宿主工具记录；请求编号只标识一条诊断，不作为跨系统追踪ID。携带Cookie不证明登录有效，错误码不证明平台内部风控策略。日志写入失败不改变原响应或异常、取消行为及POST是否已提交的判断；不新增请求、重试、后台监听或风控绕过。
+诊断不含查询参数、请求体、响应正文、原始错误说明、异常栈、请求头、Cookie值、账号资料或会话ID，不进入模型回执或经历。排查时按时间和接口对应宿主工具记录；请求编号只标识一条诊断，不作为跨系统追踪ID。携带Cookie不证明登录有效，错误码不证明平台内部风控策略。日志写入失败不改变原响应或异常、取消行为及POST是否已提交的判断；不新增请求、重试、后台监听或风控绕过。 0.2.9新增info级“B站评论诊断”，包含提交/可见性阶段、随机请求关联号、最小targetAid/commentId、HTTP/API码、状态与结果枚举；可以关联同一评论的提交及查询，仍不含正文、主人UID、Cookie或带签名URL。
 
 `danmakuEnabled`、`autoRefreshEnabled` 均默认false，旧配置缺字段按false迁移。弹幕仅经safe临时工具返回文字、精确字符串id与视频秒数；时间窗为[from,to)，获取必要的6分钟分段，每段限2MiB/12000条，只保留模式1–6，最多返回12000条，每页100条，每条最多500字。truncated表明裁切，excludedModes统计窗口内未返回的特殊模式；不暴露发送者哈希，不执行代码弹幕，不能视为全量历史。无需vision/声音，不自动记历史。
 
 0.1.8 移除投币能力，`bilibili_interact` 不再支持 `action=coin`，工具契约不再提供 `coinCount`。旧配置中的 `interactions.coin` 只作兼容读取并忽略，不返回为可用开关。旧 `data/actions.json` 中的投币记录及其字段继续兼容并保留；不因移除功能清空账本，也不重放旧投币动作。其余五项互动仍独立默认关闭，弹幕与自动续期不受影响。
 
 自动续期由账号管理器在业务请求前按需检查（不是后台监控）。成功检查24小时内不重复，检查失败15分钟冷却，重启不保留检查间隔。QR确认保存refresh_token；Cookie导入可选refreshToken，未提供时不能自动续期。固定cookie/info与correspond请求取得续期信息，pending先保存，然后提交cookie/refresh、校验同一账号、保存新Cookie及token，再confirm/refresh旧token，最后清除标记。中断标记重启按uncertain处理且不重放；本地无法确认完成时请重新登录。仅两个固定passport路径允许POST，凭据只保存在account.json，不返回模型、页面、回执、日志。state/status的renewal仅含enabled/available/status/lastCheckedAt；GET状态不发平台请求。凭据轮换改变编辑revision但保留当前运行中的账号身份代际；人工账号变更仍失效旧引用。关闭开关或停止会取消后续步骤，不能撤销已提交的远端变化。
+
+## 请求保护与设备上下文（0.2.9）
+
+生产客户端接入统一Transport包装，API请求串行且默认相隔1500ms；每登录会话每小时/UTC日读取预算600/3000，互动写预算12/30且间隔120秒，额度在发起前保存。互动写仅含点赞、收藏、关注、评论/回复；历史报告及续期不消耗互动额度，仍参与API总流量控制。CDN不占API串行队列。排队、存盘及网络均计入请求超时，停止或取消不能迟到发出请求。
+
+HTTP412/429及明确限制码触发5/10/20/30分钟暂停并尊重更长Retry-After；验证码暂停当前登录会话30分钟，过期只允许再尝试，不代表平台已解限；登录失效可经nav或重新扫码恢复。恢复接口仍受请求间隔和预算约束。保护状态只保存会话哈希、时间、计数和布尔标记，不存Cookie或正文；宿主传入的不合法状态拒绝使用。若宿主将损坏JSON折叠为空对象，本层无法区别其与首次空状态，不承诺检测这种底层损坏。
+
+traffic-state.json属于插件私有数据并跨重载保留。保护失败在提交前以TransportError(submitted=false)返回；明确的四类本地traffic拒绝允许下一次主动调用同ID/同指纹重试，平台拒绝及不确定提交不因此重放。重试不是定时任务，不在后台发送。
+
+device-state.json只存最多32组规范Cookie的SHA256范围键与buvid3，不存原Cookie。已提供buvid3优先使用；缺少时复用持久设备或正常接口取得并保存，搜索/字幕/评论共享。匿名设备只放内存。账号范围隔离，保存失败阻止新的评论提交；不修改account.json，不将设备值送入日志/模型。

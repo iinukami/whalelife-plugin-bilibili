@@ -5,6 +5,10 @@
 const messages: Record<string, string> = {
   invalid_input: '输入不符合要求。', network_error: 'B 站网络请求失败。', timeout: '请求超时。', cancelled: '操作已取消。', stopped: '插件已停止。',
   access_blocked: 'B 站要求验证或限制访问，请稍后人工检查。', login_required: '需要有效的 B 站登录。', platform_error: 'B 站拒绝了此次操作。',
+  traffic_paused: 'B 站请求保护正在等待恢复，本次未发送；请稍后再试。',
+  traffic_cooldown: 'B 站互动正在冷却，本次未发送；请稍后再试。',
+  traffic_budget: '已达到 B 站本地请求额度，本次未发送。',
+  traffic_verification: 'B 站要求验证或登录已失效，已暂停此登录态的普通请求，请先人工检查。',
   media_download_rejected: '视频下载阶段收到 HTTP 567，服务器未接受本次视频下载请求。',
   unsupported_media: '此视频未提供当前支持的完整 MP4 媒体。', too_large: '媒体或响应超过本次读取上限。', unsafe_url: '来源地址未通过校验。',
   malformed_response: 'B 站响应不完整或结构已变化。', reference_unavailable: '引用已过期、不属于当前会话或账号已改变，请重新浏览。',

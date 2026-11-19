@@ -9,6 +9,8 @@ import type { ToolSession } from 'whalelife';
 import { BiliRuntime, type RuntimeOptions } from '../src/runtime.ts';
 import { applyWithDependencies } from '../src/index.ts';
 import { defaults } from '../src/config.ts';
+import { TransportError } from '../src/transport.ts';
+import { BiliClient } from '../src/client.ts';
 import type { BiliClientContract, CallOptions, CommentPublication, InteractionInput, InteractionResult, VideoDetails } from '../src/types.ts';
 
 const video: VideoDetails = { bvid: 'BV1xx411c7mD', aid: 123, cid: 456, duration: 120,
@@ -183,4 +185,116 @@ test('registered comment and reply tools record accepted submission without clai
   for (const item of memory.slice(0, 2)) { assert.match(item.text, /不确认公开可见或通知送达/); assert.equal(item.outcome, 'succeeded'); }
   assert.equal(memory[2].text, '在 B 站完成点赞视频，已取得平台确认。');
   assert.match(tools.get('bilibili_interact').description, /confirmed只表示平台接收/);
+});
+
+
+test('accepted unknown comments refresh read-only after thirty seconds and never submit again', async t => {
+  const f = fixture(t); let clock = 1000, reads = 0;
+  f.options.now = () => clock;
+  f.result({ state: 'confirmed', platformId: '999', comment: { ...UNKNOWN, postState: 0, checkedAt: new Date(clock).toISOString(), attempts: 2,
+    evidence: [{ audience: 'anonymous', outcome: 'not_found', httpStatus: 200, apiCode: 12006 }] } });
+  f.client.checkCommentPublication = async (input, id, options) => {
+    reads++; assert.equal(input.aid, video.aid); assert.equal(id, '999'); options.assertCurrent?.();
+    return { ...PUBLIC, checkedAt: new Date(clock).toISOString(), attempts: 1, evidence: [{ audience: 'anonymous', outcome: 'public', httpStatus: 200, apiCode: 0, state: 0 }] };
+  };
+  const runtime = f.create(); await runtime.initialize(); const input = args(await f.open(runtime));
+  await runtime.interact(input, f.session); await runtime.interact(input, f.session); assert.equal(reads, 0);
+  clock = 32000;
+  const refreshed: any = await runtime.interact(input, f.session);
+  assert.equal(reads, 1); assert.equal(f.posts.length, 1); assert.equal(refreshed.content.data.duplicate, true);
+  assert.equal(refreshed.content.data.comment.visibility, 'public'); assert.equal(refreshed.content.data.comment.postState, 0);
+  assert.equal(f.saved.entries[0].comment.checkedAt, new Date(clock).toISOString());
+  assert.deepEqual(f.saved.entries[0].commentTarget, { action: 'comment', aid: video.aid });
+  clock = 70000; await runtime.interact(input, f.session); assert.equal(reads, 1); assert.equal(f.posts.length, 1);
+});
+
+test('read-only refresh preserves acceptance on cancellation and evidence persistence failure', async t => {
+  for (const boundary of ['cancel', 'save']) {
+    const f = fixture(t); f.result({ state: 'confirmed', platformId: '999', comment: UNKNOWN });
+    await f.runtime.initialize(); const input = args(await f.open()); await f.runtime.interact(input, f.session);
+    f.client.checkCommentPublication = async (_input, _id, options) => {
+      if (boundary === 'cancel') { f.controller.abort(); options.assertCurrent?.(); }
+      return { ...PUBLIC, checkedAt: new Date(1000).toISOString(), attempts: 1 };
+    };
+    if (boundary === 'save') f.onSave(async () => { throw Error(SECRET); });
+    const result: any = await f.runtime.interact(input, f.session);
+    assert.equal(result.content.data.state, 'confirmed'); assert.equal(result.content.data.duplicate, true); assert.equal(f.posts.length, 1);
+    if (boundary === 'save') { assert.equal(result.content.data.ledgerSaved, false); assert.equal(result.content.data.comment.visibility, 'public'); }
+    else assert.equal(result.content.data.comment.visibility, 'unknown');
+    assert.ok(!JSON.stringify(result).includes(SECRET));
+  }
+});
+
+test('publication diagnostics retain only typed safe evidence in receipts and reloaded ledger', async t => {
+  const f = fixture(t);
+  const comment = { ...PUBLIC, postState: 0, postInvisible: false, checkedAt: new Date(1000).toISOString(), attempts: 1,
+    evidence: [{ audience: 'anonymous', outcome: 'public', httpStatus: 200, apiCode: 0, state: 0, message: SECRET, cookie: SECRET },
+      { audience: SECRET, outcome: 'public' }, { audience: 'account', outcome: SECRET }] };
+  f.result({ state: 'confirmed', platformId: '999', comment }); await f.runtime.initialize();
+  await f.runtime.interact(args(await f.open()), f.session);
+  assert.equal(f.saved.entries[0].comment.evidence.length, 1); assert.equal(f.saved.entries[0].comment.postState, 0);
+  assert.ok(!JSON.stringify(f.saved).includes(SECRET));
+  const restarted = f.create(); await restarted.initialize(); const result: any = await restarted.interact(args(await f.open(restarted)), f.session);
+  assert.equal(result.content.data.comment.evidence.length, 1); assert.equal(f.posts.length, 1);
+});
+
+test('transport rejection before submission is rejected but a dispatched failure remains uncertain', async t => {
+  for (const submitted of [false, true]) {
+    const f = fixture(t); await f.runtime.initialize(); f.onPost(async () => { throw new TransportError(submitted ? 'network_error' : 'traffic_cooldown', submitted); });
+    const result: any = await f.runtime.interact(args(await f.open()), f.session);
+    assert.equal(result.content.data, undefined); assert.equal(result.content.state, submitted ? 'uncertain' : 'rejected');
+    assert.equal(result.content.error.code, submitted ? 'uncertain' : 'traffic_cooldown');
+    assert.equal(f.saved.entries[0].state, submitted ? 'uncertain' : 'rejected');
+  }
+});
+
+
+test('an explicitly unsubmitted local traffic rejection permits an intentional same-ID retry after reload', async t => {
+  const f = fixture(t); await f.runtime.initialize();
+  f.onPost(async () => { throw new TransportError('traffic_cooldown', false); });
+  const first: any = await f.runtime.interact(args(await f.open()), f.session);
+  assert.equal(first.content.state, 'rejected'); assert.equal(f.saved.entries[0].retryableBeforeSend, true);
+  assert.equal(f.posts.length, 1, 'no automatic retry');
+  f.onPost(async () => {});
+  const restarted = f.create(); await restarted.initialize(); const input = args(await f.open(restarted));
+  const next: any = await restarted.interact(input, f.session); assert.equal(next.content.data.state, 'confirmed');
+  assert.equal(f.saved.entries.length, 1); assert.equal(f.saved.entries[0].retryableBeforeSend, undefined);
+  await restarted.interact(input, f.session); assert.equal(f.posts.length, 2, 'one rejected attempt and one accepted attempt only');
+});
+
+test('array-like enum values cannot cross the publication whitelist', async t => {
+  const f = fixture(t); f.result({ state: 'confirmed', platformId: '999', comment: { ...PUBLIC, evidence: [
+    { audience: ['anonymous'], outcome: 'public' }, { audience: 'anonymous', outcome: ['public'] },
+    { audience: 'account', outcome: 'transport_error', errorCode: ['timeout'] },
+  ] } }); await f.runtime.initialize();
+  const result: any = await f.runtime.interact(args(await f.open()), f.session);
+  assert.deepEqual(result.content.data.comment.evidence, [{ audience: 'account', outcome: 'transport_error' }]);
+});
+
+
+test('real client preparation failure crosses runtime as unsubmitted with no platform POST', async t => {
+  const f = fixture(t); let posts = 0;
+  const real = new BiliClient({ transport: { async request(url, options) {
+    if (options.method === 'POST') posts++;
+    return { status: 200, headers: {}, url, body: Buffer.from(JSON.stringify({ code: -352 })) };
+  }, dispose() {} } });
+  t.after(() => real.dispose()); f.client.interact = real.interact.bind(real);
+  await f.runtime.initialize(); const result: any = await f.runtime.interact(args(await f.open()), f.session);
+  assert.equal(posts, 0); assert.equal(result.content.state, 'rejected');
+  assert.equal(result.content.error.code, 'access_blocked'); assert.equal(f.saved.entries[0].state, 'rejected');
+});
+
+
+test('retrying an earlier cooled-down ID cannot override another accepted or uncertain equivalent action', async t => {
+  for (const laterState of ['confirmed', 'uncertain']) {
+    const f = fixture(t); await f.runtime.initialize(); const ref = await f.open();
+    f.onPost(async () => { throw new TransportError('traffic_cooldown', false); });
+    await f.runtime.interact(args(ref, 'synthetic-first-id'), f.session);
+    f.onPost(async () => { if (laterState === 'uncertain') throw new TransportError('network_error', true); });
+    await f.runtime.interact(args(ref, 'synthetic-second-id'), f.session); assert.equal(f.posts.length, 2);
+    const restarted = f.create(); await restarted.initialize();
+    const result: any = await restarted.interact(args(await f.open(restarted), 'synthetic-first-id'), f.session);
+    assert.equal(result.content.data.state, laterState); assert.equal(result.content.data.duplicate, true);
+    assert.equal(f.posts.length, 2, 'a previous unsubmitted ID cannot cause a third attempt');
+  }
 });

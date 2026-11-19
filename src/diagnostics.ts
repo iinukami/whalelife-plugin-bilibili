@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { BiliError } from './errors.ts';
 import { readWbiKeys } from './wbi.ts';
 import type { Transport, TransportOptions, TransportResponse } from './transport.ts';
+import type { CommentEvidence } from './types.ts';
 
 export interface RequestDiagnostic extends Partial<SubtitleDetails> {
   requestId: string;
@@ -15,7 +16,11 @@ export interface RequestDiagnostic extends Partial<SubtitleDetails> {
   method: 'GET' | 'POST' | 'unknown';
   hasSessionCookie: boolean;
   elapsedMs: number;
-  stage: 'http' | 'api' | 'transport' | 'response' | 'parse';
+  stage: 'http' | 'api' | 'transport' | 'response' | 'parse' | 'comment';
+  commentPhase?: 'submission' | 'visibility';
+  targetAid?: number; commentId?: string;
+  audience?: CommentEvidence['audience']; outcome?: CommentEvidence['outcome'] | 'accepted';
+  postState?: number; postInvisible?: boolean;
   phase?: 'subtitle_prepare' | 'subtitle_tracks' | 'subtitle_body';
   responseBytes?: number;
   httpStatus?: number;
@@ -54,6 +59,15 @@ const responseReports = new WeakMap<TransportResponse, (failure: Failure) => voi
 export function reportSubtitleResponse(response: TransportResponse, details: SubtitleDetails, errorCode = 'malformed_response') {
   try { responseReports.get(response)?.({ stage: 'parse', errorCode, ...details }); } catch { /* Observation cannot affect parsing. */ }
 }
+const commentReports = new WeakMap<TransportResponse, (details: CommentDetails) => void>();
+export interface CommentDetails {
+  commentPhase: 'submission' | 'visibility'; targetAid: number; commentId: string;
+  audience?: CommentEvidence['audience']; outcome: CommentEvidence['outcome'] | 'accepted';
+  postState?: number; postInvisible?: boolean; apiCode?: number;
+}
+export function reportCommentResponse(response: TransportResponse, details: CommentDetails) {
+  try { commentReports.get(response)?.(details); } catch { /* Observation cannot change the external result. */ }
+}
 export type DiagnosticSink = (event: RequestDiagnostic) => void | Promise<void>;
 
 // Only these exact public routes can contribute a host/path to a diagnostic.
@@ -90,7 +104,7 @@ const passportPaths: Readonly<Record<string, string>> = Object.freeze({
   '/x/passport-login/web/confirm/refresh': 'refresh_confirm',
 });
 const transportCodes = new Set(['invalid_input', 'network_error', 'timeout', 'cancelled', 'stopped', 'access_blocked',
-  'login_required', 'platform_error', 'unsupported_media', 'too_large', 'unsafe_url', 'malformed_response', 'uncertain']);
+  'traffic_paused', 'traffic_cooldown', 'traffic_budget', 'traffic_verification', 'persistence_error', 'config_invalid', 'config_conflict', 'login_required', 'platform_error', 'unsupported_media', 'too_large', 'unsafe_url', 'malformed_response', 'uncertain']);
 const jsonLimit = 2 * 1024 * 1024;
 const ordinaryPollCodes = new Set([0, 86101, 86090, 86038]);
 type RequestContext = Pick<RequestDiagnostic, 'endpoint' | 'host' | 'path' | 'method' | 'hasSessionCookie' | 'phase'> & { json: boolean; searchKeys: boolean };
@@ -191,6 +205,19 @@ export function withDiagnostics(transport: Transport, sink?: DiagnosticSink): Tr
             if (Number.isInteger(response.status) && response.status >= 100 && response.status <= 599) httpStatus = response.status;
             if (request.phase && response.status >= 200 && response.status < 300 && Buffer.isBuffer(response.body)) responseBytes = response.body.length;
             responseReports.set(response, report);
+            commentReports.set(response, details => {
+              if (!request || !Number.isSafeInteger(details.targetAid) || details.targetAid < 1 || !/^[1-9]\d{0,19}$/.test(details.commentId)) return;
+              const { json: _json, searchKeys: _keys, ...fields } = request;
+              const event: RequestDiagnostic = { requestId: randomUUID(), ...fields, stage: 'comment',
+                elapsedMs: Math.max(0, Math.round(performance.now() - started)),
+                ...(httpStatus !== undefined ? { httpStatus } : {}),
+                commentPhase: details.commentPhase, targetAid: details.targetAid, commentId: details.commentId,
+                outcome: details.outcome, ...(details.audience ? { audience: details.audience } : {}),
+                ...(Number.isSafeInteger(details.apiCode) ? { apiCode: details.apiCode } : {}),
+                ...(Number.isSafeInteger(details.postState) && details.postState! >= 0 ? { postState: details.postState } : {}),
+                ...(typeof details.postInvisible === 'boolean' ? { postInvisible: details.postInvisible } : {}) };
+              void Promise.resolve(sink(event)).catch(() => {});
+            });
           }
         } catch { /* Keep the original response. */ }
         try { if (request) { const failure = observe(response, request); if (failure) report(failure); } } catch { /* Keep the original response. */ }

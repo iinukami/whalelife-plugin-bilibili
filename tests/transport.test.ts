@@ -211,3 +211,54 @@ test('comment credential headers never follow a redirect or cause a second submi
     error => error instanceof TransportError && error.code === 'uncertain' && error.submitted);
   assert.equal(f.calls.length, 1); assert.deepEqual(f.dns, ['api.bilibili.com']);
 });
+
+
+test('signed comment POST accepts exactly one WBI signature and timestamp without weakening credential boundaries', async t => {
+  const csrf = '0123456789abcdef0123456789abcdef', signature = 'a'.repeat(32);
+  const f = fixture([{ headers: { 'retry-after': '600' } }]); t.after(() => f.transport.dispose());
+  const url = 'https://api.bilibili.com/x/v2/reply/add?w_rid=' + signature + '&wts=1795100000';
+  const settings = { ...options, method: 'POST' as const, body: 'csrf=' + csrf, headers: { Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf } };
+  const result = await f.transport.request(url, settings);
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].url.href, url); assert.equal(result.headers['retry-after'], '600');
+  const bad = fixture(); t.after(() => bad.transport.dispose());
+  for (const query of ['w_rid=' + signature, 'wts=1795100000', 'w_rid=x&wts=1795100000', 'w_rid=' + signature + '&wts=0',
+    'w_rid=' + signature + '&wts=-1', 'w_rid=' + signature + '&wts=1e9', 'w_rid=' + signature + '&wts=1795100000&extra=1',
+    'w_rid=' + signature + '&wts=1795100000&wts=1795100000', 'w_rid=' + signature + '&w_rid=' + signature + '&wts=1795100000'])
+    await assert.rejects(bad.transport.request('https://api.bilibili.com/x/v2/reply/add?' + query, settings), errorCode('unsafe_url'));
+  assert.equal(bad.calls.length, 0); assert.deepEqual(bad.dns, []);
+});
+
+test('signed comment credentials cannot follow redirects and Retry-After survives rejected HTTP responses', async t => {
+  const csrf = '0123456789abcdef0123456789abcdef';
+  const f = fixture([{ status: 302, headers: { location: 'https://cdn.example/' } }, { status: 429, headers: { 'retry-after': '900' } }]); t.after(() => f.transport.dispose());
+  await assert.rejects(f.transport.request('https://api.bilibili.com/x/v2/reply/add?w_rid=' + 'b'.repeat(32) + '&wts=1795100000',
+    { ...options, method: 'POST', body: 'csrf=' + csrf, headers: { Cookie: 'SESSDATA=synthetic', Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf } }),
+    error => error instanceof TransportError && error.code === 'uncertain' && error.submitted);
+  assert.equal(f.calls.length, 1);
+  const blocked = await f.transport.request('https://api.bilibili.com/x/test', options);
+  assert.equal(blocked.status, 429); assert.equal(blocked.headers['retry-after'], '900');
+});
+
+
+test('account and permission changes while DNS resolves prevent actual POST transmission', async t => {
+  for (const code of ['account_changed', 'interaction_disabled']) {
+    let resolve!: (value: {address:string;family:number}[]) => void, changed = false, sent = 0;
+    const transport = createTransport({ lookup: () => new Promise(accept => { resolve = accept; }), request() { sent++; throw Error('unexpected send'); } });
+    t.after(() => transport.dispose());
+    const post = transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, method: 'POST', body: 'synthetic=1',
+      beforeDispatch() { if (changed) throw new BiliError(code); } });
+    const rejected = assert.rejects(post, cause => cause instanceof TransportError && cause.code === code && !cause.submitted);
+    await new Promise(accept => setImmediate(accept)); changed = true; resolve([{ address: '93.184.216.34', family: 4 }]); await rejected;
+    assert.equal(sent, 0);
+  }
+});
+
+test('beforeDispatch stays local and untrusted callback exceptions produce safe fixed errors', async t => {
+  const f = fixture([{}]); t.after(() => f.transport.dispose()); let calls = 0;
+  await f.transport.request('https://api.bilibili.com/x/test', { ...options, beforeDispatch() { calls++; } });
+  assert.equal(calls, 1); assert.equal(f.calls[0].options.beforeDispatch, undefined); assert.equal(f.calls[0].options.headers.beforeDispatch, undefined);
+  const blocked = fixture(); t.after(() => blocked.transport.dispose());
+  await assert.rejects(blocked.transport.request('https://api.bilibili.com/x/v2/reply/add', { ...options, method: 'POST', body: 'x=1', beforeDispatch() { throw Error('PRIVATE_PERMISSION_REASON'); } }),
+    cause => cause instanceof TransportError && cause.code === 'config_conflict' && !cause.submitted && !cause.message.includes('PRIVATE'));
+  assert.equal(blocked.calls.length, 0);
+});

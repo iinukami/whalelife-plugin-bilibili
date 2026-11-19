@@ -5,6 +5,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { MultimodalToolOutput, OptionalService, ToolSession, TransientToolOutput } from 'whalelife';
 import { BiliError, object, safeError } from './errors.ts';
+import { TransportError } from './transport.ts';
 import { HistorySync } from './history-sync.ts';
 import { QQSharing } from './qq-share.ts';
 import type { HistoryOutcome } from './history-sync.ts';
@@ -24,7 +25,7 @@ type SubtitlePage = { part: number; language?: string; offset: number };
 type MediaRef = { session: string; account: string; ref: string; expires: number; binding: OptionalService<VisionService> };
 // Retain historical coin records when saving the ledger; no current action creates or replays them.
 type LegacyCoinLedgerFields = { coinTargetHash?: string; coinTarget?: number; coinAmount?: number };
-type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string; comment?: CommentPublication } & LegacyCoinLedgerFields;
+type LedgerEntry = { key: string; fingerprint: string; state: 'pending' | 'confirmed' | 'rejected' | 'uncertain'; platformId?: string; comment?: CommentPublication; retryableBeforeSend?: true; submittedAt?: string; commentTarget?: { action: 'comment' | 'reply'; aid: number; root?: string; parent?: string } } & LegacyCoinLedgerFields;
 export interface RuntimeOptions {
   signal: AbortSignal; transient: boolean; config: () => Config; account: () => AccountState | undefined; accountRevision?: () => string;
   readLedger: () => Promise<unknown>; saveLedger: (value: unknown) => Promise<void>; now?: () => number;
@@ -45,7 +46,27 @@ function commentPublication(value: unknown): CommentPublication {
   if (typeof row.visibility !== 'string' || !['public', 'not_public', 'unknown'].includes(row.visibility) || typeof row.checkedAnonymously !== 'boolean'
     || row.notification !== 'unverified' || row.state !== undefined && (!Number.isSafeInteger(row.state) || Number(row.state) < 0)) return unknown;
   const visibility = row.visibility === 'public' && (!row.checkedAnonymously || row.state !== 0) ? 'unknown' : row.visibility as CommentPublication['visibility'];
-  return { visibility, ...(typeof row.state === 'number' ? { state: row.state } : {}), checkedAnonymously: row.checkedAnonymously, notification: 'unverified' };
+  const result: CommentPublication = { visibility, ...(typeof row.state === 'number' ? { state: row.state } : {}), checkedAnonymously: row.checkedAnonymously, notification: 'unverified' };
+  if (Number.isSafeInteger(row.postState) && Number(row.postState) >= 0) result.postState = Number(row.postState);
+  if (typeof row.postInvisible === 'boolean') result.postInvisible = row.postInvisible;
+  if (typeof row.checkedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(row.checkedAt) && Number.isFinite(Date.parse(row.checkedAt))) result.checkedAt = row.checkedAt;
+  if (Number.isInteger(row.attempts) && Number(row.attempts) >= 0 && Number(row.attempts) <= 2) result.attempts = Number(row.attempts);
+  if (Array.isArray(row.evidence)) {
+    const outcomes = new Set(['public', 'account_visible', 'hidden', 'not_found', 'identity_mismatch', 'invalid_response', 'api_error', 'http_error', 'transport_error', 'cancelled', 'account_changed']);
+    const errors = new Set(['timeout', 'network_error', 'access_blocked', 'login_required', 'stopped', 'cancelled', 'account_changed', 'malformed_response', 'traffic_paused', 'traffic_cooldown', 'traffic_budget', 'traffic_verification', 'persistence_error', 'config_invalid', 'config_conflict', 'unsafe_url']);
+    result.evidence = row.evidence.slice(0, 3).flatMap(value => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const item = value as Record<string, unknown>;
+      if (typeof item.audience !== 'string' || !['anonymous', 'account'].includes(item.audience) || typeof item.outcome !== 'string' || !outcomes.has(item.outcome)) return [];
+      return [{ audience: item.audience, outcome: item.outcome,
+        ...(Number.isSafeInteger(item.httpStatus) && Number(item.httpStatus) >= 100 && Number(item.httpStatus) <= 599 ? { httpStatus: item.httpStatus } : {}),
+        ...(Number.isSafeInteger(item.apiCode) ? { apiCode: item.apiCode } : {}),
+        ...(Number.isSafeInteger(item.state) && Number(item.state) >= 0 ? { state: item.state } : {}),
+        ...(typeof item.errorCode === 'string' && errors.has(item.errorCode) ? { errorCode: item.errorCode } : {}),
+      } as NonNullable<CommentPublication['evidence']>[number]];
+    });
+  }
+  return result;
 }
 function commentFields(value: unknown) {
   const comment = commentPublication(value);
@@ -53,7 +74,7 @@ function commentFields(value: unknown) {
     : comment.visibility === 'not_public' ? '检查时未公开可见，可能处于审核或显示延迟，不能据此确定平台原因。'
       : '尚未确认公开可见。';
   return { comment, notice: 'confirmed 仅表示平台已接收评论或回复，不表示已经公开或通知已送达。' + visibility
-    + '可见性是已有检查结果，重复查询不会自动刷新；不要换 operationId 补发。' };
+    + '可见性以最近检查时间为准；未确认公开的已接收操作再次调用时可只读复查，30秒内复用结果，绝不再次提交；不要换 operationId 补发。' };
 }
 
 export class BiliRuntime {
@@ -98,6 +119,13 @@ export class BiliRuntime {
           || !Number.isInteger(e.coinAmount) || Number(e.coinAmount) < 0 || Number(e.coinAmount) > 2)) throw new BiliError('config_invalid');
         return { key: String(e.key), fingerprint: String(e.fingerprint), state: e.state as LedgerEntry['state'],
           ...(e.comment !== undefined ? { comment: commentPublication(e.comment) } : {}), ...(typeof e.platformId === 'string' && /^\d{1,30}$/.test(e.platformId) ? { platformId: e.platformId } : {}),
+          ...(e.retryableBeforeSend === true && e.state === 'rejected' ? { retryableBeforeSend: true as const } : {}),
+          ...(typeof e.submittedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(e.submittedAt) && Number.isFinite(Date.parse(e.submittedAt)) ? { submittedAt: e.submittedAt } : {}),
+          ...(e.commentTarget && typeof e.commentTarget === 'object' && !Array.isArray(e.commentTarget)
+            && typeof (e.commentTarget as any).action === 'string' && ['comment', 'reply'].includes((e.commentTarget as any).action) && Number.isSafeInteger((e.commentTarget as any).aid) && (e.commentTarget as any).aid > 0
+            && ['root', 'parent'].every(key => (e.commentTarget as any)[key] === undefined || typeof (e.commentTarget as any)[key] === 'string' && /^\d{1,30}$/.test((e.commentTarget as any)[key]))
+            ? { commentTarget: { action: (e.commentTarget as any).action as 'comment' | 'reply', aid: (e.commentTarget as any).aid,
+                ...((e.commentTarget as any).root ? { root: (e.commentTarget as any).root } : {}), ...((e.commentTarget as any).parent ? { parent: (e.commentTarget as any).parent } : {}) } } : {}),
           ...(e.coinTargetHash !== undefined ? { coinTargetHash: String(e.coinTargetHash), coinTarget: Number(e.coinTarget), coinAmount: Number(e.coinAmount) } : {}) };
       });
       this.ledgerReady = true;
@@ -503,25 +531,48 @@ export class BiliRuntime {
         const payload: unknown[] = [account.mid, action, ref.video.aid, ref.video.owner.mid, ref.comment?.rpid, folderId, text];
         if (mentionOwner) payload.push({ mentionOwner });
         const fingerprint = hash(payload);
-        const previous = this.ledger.find(e => e.key === key) ?? this.ledger.find(e => e.state !== 'rejected' && e.fingerprint === fingerprint);
-        if (previous?.key === key && previous.fingerprint !== fingerprint) throw new BiliError('invalid_input');
-        if (previous) {
+        const exact = this.ledger.find(e => e.key === key);
+        if (exact && exact.fingerprint !== fingerprint) throw new BiliError('invalid_input');
+        const sameContent = this.ledger.find(e => e.state !== 'rejected' && e.fingerprint === fingerprint);
+        // An earlier unsubmitted rejection cannot override a later accepted or uncertain equivalent action.
+        const previous = exact?.state === 'rejected' && exact.retryableBeforeSend ? sameContent ?? exact : exact ?? sameContent;
+        if (previous && !(previous.state === 'rejected' && previous.retryableBeforeSend === true)) {
           duplicate = true;
           if (previous.state === 'confirmed') {
             entry = previous;
-            if (isComment) previous.comment = commentPublication(previous.comment);
+            if (isComment) {
+              previous.comment = commentPublication(previous.comment);
+              const checkedAt = previous.comment.checkedAt ? Date.parse(previous.comment.checkedAt) : NaN;
+              if (previous.platformId && previous.comment.visibility !== 'public' && this.client.checkCommentPublication
+                && (!Number.isFinite(checkedAt) || this.now() - checkedAt >= 30000)) {
+                try {
+                  const target = { action: action as 'comment' | 'reply', aid: ref.video.aid, bvid: ref.video.bvid,
+                    ...(ref.comment ? { parent: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root } : {}) };
+                  const refreshed = await this.client.checkCommentPublication(target, previous.platformId,
+                    { ...options, assertCurrent: () => { this.checkOperation(identity, options); check(); } });
+                  previous.comment = commentPublication({ ...refreshed,
+                    ...(previous.comment.postState !== undefined ? { postState: previous.comment.postState } : {}),
+                    ...(previous.comment.postInvisible !== undefined ? { postInvisible: previous.comment.postInvisible } : {}) });
+                  ledgerSaved = true;
+                  try { await this.options.saveLedger({ entries: this.ledger }); } catch { this.ledgerReady = false; ledgerSaved = false; }
+                } catch { /* A read failure cannot revoke an accepted write or cause a repost. */ }
+              }
+            }
             await this.options.recordAction?.(id, previous.key, action).catch(() => {});
           }
           return { state: previous.state === 'pending' ? 'uncertain' : previous.state, duplicate: true, platformId: previous.platformId,
-            ...(isComment && previous.state === 'confirmed' ? commentFields(previous.comment) : {}) };
+            ...(isComment && previous.state === 'confirmed' ? commentFields(previous.comment) : {}), ...(ledgerSaved !== undefined ? { ledgerSaved } : {}) };
         }
-        if (this.ledger.length >= 4096) throw new BiliError('busy');
+        if (!previous && this.ledger.length >= 4096) throw new BiliError('busy');
         const verified = await this.client.account(options); check();
         if (verified.mid !== account.mid || this.identity() !== account.revision) throw new BiliError('account_changed');
         if (action === 'favorite' && !(await this.client.folders(account.mid, options)).some(folder => folder.id === folderId)) throw new BiliError('folder_required');
         check();
         options.signal?.throwIfAborted();
-        entry = { key, fingerprint, state: 'pending' }; this.ledger.push(entry);
+        entry = { key, fingerprint, state: 'pending', submittedAt: new Date(this.now()).toISOString(),
+          ...(isComment ? { commentTarget: { action: action as 'comment' | 'reply', aid: ref.video.aid,
+            ...(ref.comment ? { parent: ref.comment.rpid, root: ref.comment.root === '0' ? ref.comment.rpid : ref.comment.root } : {}) } } : {}) };
+        if (previous) this.ledger[this.ledger.indexOf(previous)] = entry; else this.ledger.push(entry);
         try { await this.options.saveLedger({ entries: this.ledger }); }
         catch { this.ledgerReady = false; throw new BiliError('persistence_error'); }
         options.signal?.throwIfAborted();
@@ -552,7 +603,8 @@ export class BiliRuntime {
       }
       const e = safeError(error);
       if (entry) {
-        entry.state = !submitted || ['platform_error', 'login_required', 'access_blocked', 'invalid_input'].includes(e.code) ? 'rejected' : 'uncertain';
+        entry.state = !submitted || error instanceof TransportError && !error.submitted || ['platform_error', 'login_required', 'access_blocked', 'invalid_input'].includes(e.code) ? 'rejected' : 'uncertain';
+        if (error instanceof TransportError && !error.submitted && ['traffic_paused', 'traffic_cooldown', 'traffic_budget', 'traffic_verification'].includes(e.code)) entry.retryableBeforeSend = true;
         try { await this.options.saveLedger({ entries: this.ledger }); } catch { this.ledgerReady = false; }
       }
       const state = entry?.state ?? (e.code === 'uncertain' ? 'uncertain' : 'rejected');

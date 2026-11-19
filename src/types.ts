@@ -32,9 +32,19 @@ export interface SubtitleCue { from: number; to: number; text: string }
 export interface Media { bytes: Buffer; mime: string }
 export type LoginPoll = { state: 'waiting' | 'scanned' | 'expired' } | { state: 'confirmed'; cookie: string; refreshToken?: string };
 export interface OwnerProfile { uid: string; name: string }
+export interface CommentCheckInput { action: 'comment' | 'reply'; aid: number; bvid?: string; root?: string; parent?: string }
+export interface CommentEvidence {
+  audience: 'anonymous' | 'account';
+  outcome: 'public' | 'account_visible' | 'hidden' | 'not_found' | 'identity_mismatch' | 'invalid_response' | 'api_error' | 'http_error' | 'transport_error' | 'cancelled' | 'account_changed';
+  httpStatus?: number; apiCode?: number; state?: number;
+  errorCode?: 'timeout' | 'network_error' | 'access_blocked' | 'login_required' | 'stopped' | 'cancelled' | 'account_changed' | 'malformed_response' | 'traffic_paused' | 'traffic_cooldown' | 'traffic_budget' | 'traffic_verification' | 'persistence_error' | 'config_invalid' | 'config_conflict' | 'unsafe_url';
+}
 export interface CommentPublication {
   visibility: 'public' | 'not_public' | 'unknown';
+  /** State from a validated read; submission metadata has separate fields. */
   state?: number;
+  postState?: number; postInvisible?: boolean;
+  checkedAt?: string; attempts?: number; evidence?: CommentEvidence[];
   /** True only when an anonymous read returned valid evidence, not merely when a request was attempted. */
   checkedAnonymously: boolean;
   notification: 'unverified';
@@ -66,6 +76,7 @@ export interface BiliClientContract {
   pollLogin(key: string, options: CallOptions): Promise<LoginPoll>;
   folders(mid: number, options: CallOptions): Promise<{ id: string; title: string }[]>;
   interact(input: InteractionInput, options: CallOptions): Promise<InteractionResult>;
+  checkCommentPublication?(input: CommentCheckInput, platformId: string, options: CallOptions): Promise<CommentPublication>;
   dispose(): void | Promise<void>;
 }
 export interface SurfService { status(): unknown; settings(): { timeoutMs: number; concurrency: number; hasProxy: boolean }; search(input: { sessionId: string; query: string; limit?: number }, options?: { signal?: AbortSignal }): Promise<unknown> }

@@ -17,10 +17,19 @@ const errorCode = (code: string) => (error: unknown) => error instanceof BiliErr
 function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const calls: { url: string; options: TransportOptions }[] = [];
   const queue: (Partial<TransportResponse> | Error)[] = [];
-  const diagnostics: RequestDiagnostic[] = [];
+  const diagnostics: RequestDiagnostic[] = [], preparation: string[] = [];
+  let clock = 1700000000000;
   let onRequest: (() => void) | undefined;
-  const client = new BiliClient({ onDiagnostic: event => { diagnostics.push(event); }, transport: {
+  const client = new BiliClient({ publicationNow: () => clock,
+    // These tests isolate mention encoding; exhausting the check budget prevents unrelated extra read fixtures.
+    publicationSleep: async () => { clock += 30001; }, onDiagnostic: event => { diagnostics.push(event); }, transport: {
     async request(url, options) {
+      const path = new URL(url).pathname;
+      if (path === '/x/web-frontend/getbuvid' || path === '/x/web-interface/nav' && options.diagnosticPurpose === 'search_keys') {
+        preparation.push(path);
+        return { status: 200, headers: {}, url, body: Buffer.from(JSON.stringify({ code: 0, data: path.endsWith('getbuvid') ? { buvid: 'SYNTHETIC_OWNER_DEVICE' } : { wbi_img: {
+          img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png', sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png' } } })) };
+      }
       calls.push({ url, options }); onRequest?.();
       const next = queue.shift(); assert.ok(next, 'missing synthetic response');
       if (next instanceof Error) throw next;
@@ -28,7 +37,7 @@ function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     }, dispose() {},
   } });
   t.after(() => client.dispose());
-  return { client, calls, queue, diagnostics, onRequest(value: () => void) { onRequest = value; },
+  return { client, calls, queue, diagnostics, preparation, onRequest(value: () => void) { onRequest = value; },
     json(data: unknown, code = 0) { queue.push({ body: Buffer.from(JSON.stringify({ code, data })) }); },
   };
 }
@@ -83,7 +92,7 @@ test('owner lookup checks cancellation and identity guards without retrying fail
   const f = fixture(t), aborter = new AbortController(); aborter.abort();
   await assert.rejects(f.client.ownerProfile(OWNER.uid, { signal: aborter.signal }), errorCode('cancelled'));
   await assert.rejects(f.client.ownerProfile(OWNER.uid, { assertCurrent() { throw new BiliError('account_changed'); } }), errorCode('account_changed'));
-  assert.equal(f.calls.length, 0);
+  assert.equal(f.calls.length + f.preparation.length, 0);
   let changed = false;
   f.onRequest(() => { changed = true; }); f.json({ card: { mid: OWNER.uid, name: OWNER.name } });
   await assert.rejects(f.client.ownerProfile(OWNER.uid, { assertCurrent() { if (changed) throw new BiliError('account_changed'); } }), errorCode('account_changed'));
@@ -114,12 +123,14 @@ test('comment and reply submit exactly one owner prefix with a numeric at_name_t
     f.json({ reply: { rpid_str: '9007199254740993123' } }); f.json({ root: null });
     const result = await f.client.interact({ ...COMMENT, action, mentionOwner: OWNER,
       ...(action === 'reply' ? { root: '9007199254740993121', parent: '9007199254740993122' } : {}) }, { cookie: COOKIE });
-    assert.deepEqual(result, { state: 'confirmed', platformId: '9007199254740993123',
-      comment: { visibility: 'not_public', checkedAnonymously: true, notification: 'unverified' } });
+    assert.equal(result.state, 'confirmed'); assert.equal(result.platformId, '9007199254740993123');
+    assert.equal(result.comment?.visibility, 'unknown'); assert.equal(result.comment?.checkedAnonymously, true);
+    assert.equal(result.comment?.notification, 'unverified'); assert.equal(result.comment?.evidence?.[0].outcome, 'not_found');
     const call = f.calls.filter(item => item.options.method === 'POST').at(-1)!, fields = new URLSearchParams(call.options.body);
-    assert.equal(call.url, 'https://api.bilibili.com/x/v2/reply/add'); assert.equal(call.options.method, 'POST');
+    assert.equal(new URL(call.url).origin + new URL(call.url).pathname, 'https://api.bilibili.com/x/v2/reply/add');
+    assert.deepEqual([...new URL(call.url).searchParams.keys()].sort(), ['w_rid', 'wts']); assert.equal(call.options.method, 'POST');
     assert.equal(call.options.headers?.['Content-Type'], 'application/x-www-form-urlencoded');
-    assert.equal(call.options.headers?.Cookie, COOKIE);
+    assert.equal(call.options.headers?.Cookie, COOKIE + '; buvid3=SYNTHETIC_OWNER_DEVICE');
     assert.equal(fields.get('message'), '@合成主人 ' + COMMENT.text);
     assert.deepEqual(JSON.parse(fields.get('at_name_to_mid')!), { 合成主人: 456 });
     assert.equal(fields.get('oid'), '111'); assert.equal(fields.get('type'), '1'); assert.equal(fields.get('plat'), '1');
@@ -160,7 +171,7 @@ test('raw mentions including an apparent owner prefix cannot bypass the single p
     for (const mentionOwner of [undefined, OWNER])
       await assert.rejects(f.client.interact({ ...COMMENT, text, mentionOwner }, { cookie: COOKIE }), errorCode('mention_invalid'));
   }
-  assert.equal(f.calls.length, 0);
+  assert.equal(f.calls.length + f.preparation.length, 0);
 });
 
 test('only comments and replies accept an internally supplied owner and extra at fields are rejected', async t => {
@@ -172,7 +183,7 @@ test('only comments and replies accept an internally supplied owner and extra at
   for (const mentionOwner of [null, {}, { uid: '789', name: '@其他人' }, { uid: '9007199254740992', name: OWNER.name },
     { uid: 456, name: OWNER.name }, { uid: '456 ', name: OWNER.name }])
     await assert.rejects(f.client.interact({ ...COMMENT, mentionOwner } as any, { cookie: COOKIE }), errorCode('malformed_response'));
-  assert.equal(f.calls.length, 0);
+  assert.equal(f.calls.length + f.preparation.length, 0);
 });
 
 test('the 1000-character limit includes the generated prefix and preserves Unicode code points', async t => {
@@ -202,4 +213,5 @@ test('ambiguous owner-mention submissions and platform rejections never retry au
   f.json({}, -352); await assert.rejects(f.client.interact(input, { cookie: COOKIE }), errorCode('access_blocked'));
   assert.equal(f.calls.length, uncertain.length + 2);
   assert.ok(f.calls.every(call => call.options.method === 'POST'));
+  assert.deepEqual(f.preparation, ['/x/web-frontend/getbuvid', '/x/web-interface/nav']);
 });

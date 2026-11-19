@@ -3,6 +3,8 @@
  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
  */
 import { BiliError } from './errors.ts';
+import { createHash } from 'node:crypto';
+import { readCommentPublication, submissionMetadata, validateCommentCheck } from './comment-publication.ts';
 import { validateOwnerUid, validateOwnerProfile } from './owner.ts';
 import { validateLoginUrl } from './login-url.ts';
 import { readHistoryProgress, reportHistoryPosition } from './history-client.ts';
@@ -11,14 +13,15 @@ import { readDanmaku } from './danmaku-client.ts';
 import type { DanmakuInput } from './danmaku-client.ts';
 import { checkRefresh, getRefreshCsrf, renewCookies, confirmRefresh, refreshToken } from './refresh-client.ts';
 import { createTransport, safeUrl, TransportError } from './transport.ts';
-import { withDiagnostics, diagnosticType, reportSubtitleResponse } from './diagnostics.ts';
+import { withDiagnostics, diagnosticType, reportSubtitleResponse, reportCommentResponse } from './diagnostics.ts';
 import { readWbiKeys, signWbi, type WbiKeys } from './wbi.ts';
 import type { DiagnosticSink, SubtitleIssue } from './diagnostics.ts';
 import type { Transport, TransportResponse, TransportOptions } from './transport.ts';
 import type { BiliClientContract, CallOptions, VideoItem, VideoDetails, VideoList, CommentList,
-  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, InteractionResult, CommentPublication, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
+  SubtitleTrack, SubtitleCue, Media, LoginPoll, InteractionInput, InteractionResult, CommentPublication, CommentCheckInput, NotificationSource, NotificationCursor, NotificationItem, NotificationList, ThreadComment, CommentThread } from './types.ts';
 
 const API = 'https://api.bilibili.com';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PASSPORT = 'https://passport.bilibili.com';
 const BV = /^BV[A-Za-z0-9]{10}$/;
 const AUTH_COOKIES = new Set(['SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5']);
@@ -193,11 +196,19 @@ function apiData(response: TransportResponse): Record<string, any> {
 interface WbiPreparation {
   identity: string;
   buvid?: string;
+  deviceLoaded?: boolean;
   keys?: { value: WbiKeys; expires: number };
   pending: Promise<void>;
   failure?: { error: unknown };
 }
 
+export interface BiliClientOptions {
+  transport?: Transport; signal?: AbortSignal; onDiagnostic?: DiagnosticSink;
+  readDevice?: (scope: string) => string | undefined | Promise<string | undefined>;
+  saveDevice?: (scope: string, buvid: string) => void | Promise<void>;
+  publicationNow?: () => number;
+  publicationSleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
 export class BiliClient implements BiliClientContract {
   private transport: Transport;
   private aborter = new AbortController();
@@ -206,7 +217,9 @@ export class BiliClient implements BiliClientContract {
   private knownSubtitles = new Map<string, { cookie: string; referer: string; expires: number }>();
   private loginKeys = new Map<string, number>();
   private wbiPreparation?: WbiPreparation;
-  constructor(options: { transport?: Transport; signal?: AbortSignal; onDiagnostic?: DiagnosticSink } = {}) {
+  private dependencies: BiliClientOptions;
+  constructor(options: BiliClientOptions = {}) {
+    this.dependencies = options;
     this.transport = withDiagnostics(options.transport ?? createTransport(), options.onDiagnostic);
     this.signal = options.signal ? AbortSignal.any([options.signal, this.aborter.signal]) : this.aborter.signal;
   }
@@ -216,7 +229,7 @@ export class BiliClient implements BiliClientContract {
     options.assertCurrent?.();
     const timeoutMs = options.timeoutMs ?? 20000;
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 240000) throw new BiliError('invalid_input');
-    return { signal: AbortSignal.any([this.signal, ...(options.signal ? [options.signal] : [])]), timeoutMs };
+    return { signal: AbortSignal.any([this.signal, ...(options.signal ? [options.signal] : [])]), timeoutMs, beforeDispatch: () => { this.options(options); } };
   }
   historyProgress(target: HistoryTarget, options: CallOptions) {
     return readHistoryProgress(this.transport, target, { ...options, ...this.options(options) });
@@ -234,7 +247,7 @@ export class BiliClient implements BiliClientContract {
     url.search = typeof params === 'string' ? params : new URLSearchParams(params).toString();
     const cookie = checkedCookie(options.cookie);
     const response = await this.transport.request(url.href, { ...this.options(options), maxBytes: 2 * 1024 * 1024, ...(diagnosticPurpose ? { diagnosticPurpose } : {}),
-      headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate, br', 'User-Agent': 'Mozilla/5.0', Referer: referer, ...(cookie ? { Cookie: cookie } : {}) } });
+      headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip, deflate, br', 'User-Agent': USER_AGENT, Referer: referer, ...(cookie ? { Cookie: cookie } : {}) } });
     try {
       const received = safeUrl(response.url);
       if (received.hostname !== url.hostname || path === '/x/player/wbi/v2' && received.pathname !== path) throw new BiliError('unsafe_url');
@@ -256,7 +269,7 @@ export class BiliClient implements BiliClientContract {
     });
     this.options(options);
   }
-  private async prepareWbi(options: CallOptions, purpose: 'search' | 'subtitle' = 'search'): Promise<{ cookie: string; keys: WbiKeys }> {
+  private async prepareWbi(options: CallOptions, purpose: 'search' | 'subtitle' | 'comment' = 'search'): Promise<{ cookie: string; keys: WbiKeys }> {
     this.options(options);
     const identity = checkedCookie(options.cookie);
     let state = this.wbiPreparation;
@@ -276,6 +289,16 @@ export class BiliClient implements BiliClientContract {
       attempting = true;
       let cookie = identity;
       if (!cookieValue(cookie, 'buvid3')) {
+        const scope = createHash('sha256').update(identity).digest('hex');
+        const authenticated = !!cookieValue(identity, 'SESSDATA');
+        if (!state.deviceLoaded) {
+          let persisted: string | undefined;
+          try { persisted = authenticated ? await this.dependencies.readDevice?.(scope) : undefined; }
+          catch { throw new BiliError('persistence_error'); }
+          this.options(options);
+          if (persisted !== undefined && (typeof persisted !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(persisted))) throw new BiliError('persistence_error');
+          state.buvid = persisted; state.deviceLoaded = true;
+        }
         if (!state.buvid) {
           const response = await this.request('/x/web-frontend/getbuvid', {}, options, false, purpose === 'subtitle' ? 'subtitle_cookie' : undefined);
           this.options(options);
@@ -283,7 +306,12 @@ export class BiliClient implements BiliClientContract {
           try {
             issued = apiData(response);
             if (typeof issued.buvid !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(issued.buvid)) throw new BiliError('malformed_response');
-            state.buvid = issued.buvid;
+            const buvid = issued.buvid;
+            if (authenticated && this.dependencies.saveDevice) {
+              try { await this.dependencies.saveDevice(scope, buvid); } catch { throw new BiliError('persistence_error'); }
+              this.options(options);
+            }
+            state.buvid = buvid;
           } catch (error) {
             if (purpose === 'subtitle') reportSubtitleResponse(response, { reason: 'invalid_device_cookie', field: 'data.buvid', actualType: diagnosticType(issued?.buvid) });
             throw error;
@@ -382,7 +410,7 @@ export class BiliClient implements BiliClientContract {
         // Resolve only an explicitly supplied official short link. Its page body is never a data source.
         // The transport validates and pins every public HTTPS redirect; account cookies stay at the API.
         const response = await this.transport.request(url.href, { ...this.options(options), maxBytes: 2 * 1024 * 1024,
-          headers: { Accept: 'text/html', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' } });
+          headers: { Accept: 'text/html', 'User-Agent': USER_AGENT, Referer: 'https://www.bilibili.com/' } });
         url = safeUrl(response.url);
       }
       if (!['www.bilibili.com', 'm.bilibili.com', 'bilibili.com'].includes(url.hostname)) throw new BiliError('invalid_input');
@@ -536,7 +564,7 @@ export class BiliClient implements BiliClientContract {
     if (source.cookie !== checkedCookie(options.cookie)) throw new BiliError('reference_unavailable');
     if (source.expires <= Date.now()) { this.knownSubtitles.delete(url); throw new BiliError('reference_unavailable'); }
     const response = await this.transport.request(url, { ...this.options(options), maxBytes: 2 * 1024 * 1024, diagnosticPurpose: 'subtitle_body',
-      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Referer: source.referer } });
+      headers: { Accept: 'application/json', 'User-Agent': USER_AGENT, Referer: source.referer } });
     this.options(options);
     const json = parseJson(response);
     if (!Array.isArray(json.body)) {
@@ -565,7 +593,7 @@ export class BiliClient implements BiliClientContract {
   private async download(url: string, maxBytes: number, options: CallOptions, video = false) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 64 * 1024 * 1024) throw new BiliError('invalid_input');
     const response = await this.transport.request(url, { ...this.options(options), maxBytes,
-      headers: { Accept: '*/*', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/',
+      headers: { Accept: '*/*', 'User-Agent': USER_AGENT, Referer: 'https://www.bilibili.com/',
         ...(video ? { Range: 'bytes=0-', 'Accept-Encoding': 'identity' } : {}) } });
     if (video && response.status === 567) throw new BiliError('media_download_rejected');
     if ([401, 403, 412, 429, 503].includes(response.status)) throw new BiliError('access_blocked');
@@ -666,35 +694,18 @@ export class BiliClient implements BiliClientContract {
       return result;
     } catch { throw new BiliError('malformed_response'); }
   }
-  private async commentPublication(input: InteractionInput, platformId: string, reply: unknown, options: CallOptions): Promise<CommentPublication> {
-    let result: CommentPublication = { visibility: 'unknown', checkedAnonymously: false, notification: 'unverified' };
-    // The POST receipt proves acceptance only. Its non-public flags are useful even if the later read fails.
-    try {
-      const row = record(reply);
-      if (responseId(row, 'rpid') !== platformId || row.type !== undefined && row.type !== 1
-        || (row.oid !== undefined || row.oid_str !== undefined) && integer(responseId(row, 'oid')) !== input.aid) throw new BiliError('malformed_response');
-      const state = typeof row.state === 'number' && Number.isSafeInteger(row.state) && row.state >= 0 ? row.state : undefined;
-      result = { ...result, ...(state !== undefined ? { state } : {}),
-        visibility: row.invisible === true || state !== undefined && state !== 0 ? 'not_public' : 'unknown' };
-    } catch { /* Missing or mismatched POST metadata cannot establish publication. */ }
-    try {
-      // One bounded, credential-free check within the original tool call; no polling or resubmission.
-      const response = await this.request('/x/v2/reply/detail', { type: '1', oid: String(input.aid), root: platformId },
-        { ...options, cookie: undefined, timeoutMs: Math.min(options.timeoutMs ?? 20000, 5000) });
-      this.options(options);
-      const json = parseJson(response);
-      if (json.code === 12006 || json.code === 0 && json.data?.root === null)
-        return { ...result, visibility: 'not_public', checkedAnonymously: true };
-      if (json.code !== 0) return result;
-      const row = record(record(json.data).root);
-      if (row.type !== 1 || integer(responseId(row, 'oid')) !== input.aid || responseId(row, 'rpid') !== platformId
-        || responseId(row, 'root', true) !== (input.action === 'reply' ? input.root : '0')
-        || responseId(row, 'parent', true) !== (input.action === 'reply' ? input.parent : '0')
-        || typeof row.state !== 'number' || !Number.isSafeInteger(row.state) || row.state < 0
-        || typeof row.invisible !== 'boolean') return result;
-      return { visibility: row.state === 0 && !row.invisible ? 'public' : 'not_public', state: row.state,
-        checkedAnonymously: true, notification: 'unverified' };
-    } catch { return result; } // Accepted comments stay accepted after read failure, cancellation or account change.
+  async checkCommentPublication(input: CommentCheckInput, platformId: string, options: CallOptions): Promise<CommentPublication> {
+    validateCommentCheck(input, platformId);
+    const call = this.options(options);
+    const referer = 'https://www.bilibili.com/video/' + (input.bvid ?? 'av' + input.aid) + '/';
+    return readCommentPublication(input, platformId, {
+      signal: call.signal, guard: () => { this.options(options); },
+      now: this.dependencies.publicationNow, sleep: this.dependencies.publicationSleep,
+      read: (audience, timeoutMs, signal) => this.request('/x/v2/reply/detail', { type: '1', oid: String(input.aid), root: platformId },
+        { ...options, signal, timeoutMs: Math.min(timeoutMs, call.timeoutMs), cookie: audience === 'anonymous' ? undefined : options.cookie }, false, undefined, referer),
+      report: (response, evidence) => reportCommentResponse(response, { commentPhase: 'visibility', targetAid: input.aid,
+        commentId: platformId, audience: evidence.audience, outcome: evidence.outcome, apiCode: evidence.apiCode }),
+    });
   }
   async interact(input: InteractionInput, options: CallOptions): Promise<InteractionResult> {
     if (!input || !['like', 'favorite', 'follow', 'comment', 'reply'].includes(input.action) || 'coinCount' in input) throw new BiliError('invalid_input');
@@ -703,7 +714,7 @@ export class BiliClient implements BiliClientContract {
     integer(input.aid); integer(input.mid);
     if (input.bvid !== undefined) bvid(input.bvid);
     if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new BiliError('invalid_input');
-    const cookie = checkedCookie(options.cookie); const csrf = cookieValue(cookie, 'bili_jct');
+    let cookie = checkedCookie(options.cookie); const csrf = cookieValue(cookie, 'bili_jct');
     if (!cookie || !/^[A-Za-z0-9]{16,128}$/.test(csrf)) throw new BiliError('login_required');
     let path: string; const body: Record<string, string> = { csrf };
     if (input.action === 'like') { path = '/x/web-interface/archive/like'; Object.assign(body, { aid: String(input.aid), like: input.enabled === false ? '2' : '1' }); }
@@ -726,12 +737,21 @@ export class BiliClient implements BiliClientContract {
       if (input.action === 'reply') Object.assign(body, { root: identifier(input.root), parent: identifier(input.parent) });
     }
     const comment = input.action === 'comment' || input.action === 'reply';
+    let query = '';
+    let call: { signal: AbortSignal; timeoutMs: number; beforeDispatch: () => void };
+    try {
+      if (comment) {
+        const prepared = await this.prepareWbi(options, 'comment'); cookie = prepared.cookie;
+        const signed = new URLSearchParams(signWbi(body, prepared.keys));
+        query = '?' + new URLSearchParams({ w_rid: signed.get('w_rid')!, wts: signed.get('wts')! }).toString();
+      }
+      call = this.options(options);
+    } catch (error) { throw new TransportError(error instanceof BiliError ? error.code : 'network_error', false); }
     const referer = comment ? `https://www.bilibili.com/video/${input.bvid ?? 'av' + input.aid}/` : 'https://www.bilibili.com/';
-    const call = this.options(options);
     let response: TransportResponse;
     try {
-      response = await this.transport.request(API + path, { ...call, method: 'POST', body: new URLSearchParams(body).toString(), maxBytes: 1024 * 1024,
-        headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', Referer: referer, Cookie: cookie, ...(comment ? { Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf } : {}) } });
+      response = await this.transport.request(API + path + query, { ...call, method: 'POST', body: new URLSearchParams(body).toString(), maxBytes: 1024 * 1024,
+        headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': USER_AGENT, Referer: referer, Cookie: cookie, ...(comment ? { Origin: 'https://www.bilibili.com', 'x-csrf-token': csrf } : {}) } });
     } catch (error) {
       if (error instanceof TransportError && !error.submitted) throw error;
       throw new BiliError('uncertain');
@@ -744,7 +764,14 @@ export class BiliClient implements BiliClientContract {
       let data: Record<string, any>, platformId: string;
       try { data = record(json.data); platformId = identifier(data.rpid_str ?? data.rpid ?? data.reply?.rpid_str ?? data.reply?.rpid); }
       catch { throw new BiliError('uncertain'); }
-      return { state: 'confirmed', platformId, comment: await this.commentPublication(input, platformId, data.reply, options) };
+      const target: CommentCheckInput = { action: input.action, aid: input.aid, bvid: input.bvid, root: input.root, parent: input.parent };
+      const metadata = submissionMetadata(target, platformId, data.reply);
+      reportCommentResponse(response, { commentPhase: 'submission', targetAid: input.aid, commentId: platformId, outcome: 'accepted', apiCode: 0, ...metadata });
+      let publication: CommentPublication = { visibility: 'unknown', checkedAnonymously: false, notification: 'unverified', attempts: 0,
+        checkedAt: new Date((this.dependencies.publicationNow ?? Date.now)()).toISOString(), evidence: [] };
+      try { publication = await this.checkCommentPublication(target, platformId, { ...options, cookie }); }
+      catch { /* Cancellation or an account change after acceptance cannot revoke the receipt. */ }
+      return { state: 'confirmed', platformId, comment: { ...publication, ...metadata } };
     }
     return { state: 'confirmed' };
   }

@@ -16,9 +16,9 @@ for (const baseline of [DIAGNOSTICS_HOST, MINIMUM_HOST]) {
     await f.plugin('surf/bilibili', `
 import { applyWithDependencies } from ${JSON.stringify(pathToFileURL(join(root, 'src/index.ts')).href)};
 export async function apply(ctx) {
-  let accountCalls = 0, searchCalls = 0, searchKeyCalls = 0, searchCookieCalls = 0;
-  ctx.provide('diagnostic-fixture', { counts: () => ({ accountCalls, searchCalls, searchKeyCalls, searchCookieCalls }) });
-  return applyWithDependencies(ctx, { transport: {
+  let accountCalls = 0, searchCalls = 0, searchKeyCalls = 0, searchCookieCalls = 0, trafficNow = 1000000;
+  ctx.provide('diagnostic-fixture', { advance: ms => { trafficNow += ms; }, counts: () => ({ accountCalls, searchCalls, searchKeyCalls, searchCookieCalls }) });
+  return applyWithDependencies(ctx, { trafficTiming: { now: () => trafficNow, sleep: async ms => { trafficNow += ms; } }, transport: {
     async request(url, options) {
       const path = new URL(url).pathname;
       let status = 200, body;
@@ -56,10 +56,12 @@ export async function apply(ctx) {
     assert.equal(diagnostics()[0].hasSessionCookie, true);
     assert.equal((await f.request(prefix + '/login/import', args)).status, 200);
     if (baseline === DIAGNOSTICS_HOST) {
+      await f.service('diagnostic-fixture').advance(300001);
       for (let attempt = 0; attempt < 2; attempt++) {
         const result = await f.call('bilibili_search', { query: PRIVATE_QUERY });
         assert.equal(result.ok, true);
         assert.equal(result.result.error.code, 'access_blocked');
+        if (attempt === 0) await f.service('diagnostic-fixture').advance(600001);
       }
       const success = await f.call('bilibili_search', { query: PRIVATE_QUERY });
       assert.equal(success.result.status, 'ok');

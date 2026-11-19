@@ -13,6 +13,8 @@ import { BiliError } from './errors.ts';
 export interface TransportOptions {
   method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string;
   signal?: AbortSignal; timeoutMs: number; maxBytes: number;
+  /** Revalidate account, permission and target immediately before network dispatch; never sent to HTTP. */
+  beforeDispatch?: () => void;
   // Observer-only context; never sent as an HTTP header or query parameter.
   diagnosticPurpose?: 'search_keys' | 'subtitle_cookie' | 'subtitle_keys' | 'subtitle_body';
 }
@@ -25,6 +27,10 @@ export interface TransportDependencies {
 export class TransportError extends BiliError {
   readonly submitted: boolean;
   constructor(code: string, submitted: boolean) { super(code); this.submitted = submitted; }
+}
+export function assertBeforeDispatch(options: TransportOptions): void {
+  try { options.beforeDispatch?.(); }
+  catch (cause) { throw new TransportError(cause instanceof BiliError ? cause.code : 'config_conflict', false); }
 }
 const COOKIE_HOSTS = new Set(['api.bilibili.com', 'www.bilibili.com', 'passport.bilibili.com']);
 export function publicAddress(address: string): boolean {
@@ -76,7 +82,11 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
         let url = safeUrl(input);
         if (headers.origin !== undefined || headers['x-csrf-token'] !== undefined) {
           // These additional write headers must never reach media hosts, redirects or unrelated APIs.
-          if (method !== 'POST' || url.hostname !== 'api.bilibili.com' || url.pathname !== '/x/v2/reply/add' || url.search)
+          const query = [...url.searchParams];
+          const signedComment = query.length === 2 && query.filter(([name]) => name === 'w_rid').length === 1
+            && query.filter(([name]) => name === 'wts').length === 1
+            && /^[a-f0-9]{32}$/.test(url.searchParams.get('w_rid') ?? '') && /^[1-9][0-9]{0,12}$/.test(url.searchParams.get('wts') ?? '');
+          if (method !== 'POST' || url.hostname !== 'api.bilibili.com' || url.pathname !== '/x/v2/reply/add' || url.search && !signedComment)
             throw new BiliError('unsafe_url');
           if (headers.origin !== undefined && headers.origin !== 'https://www.bilibili.com') throw new BiliError('invalid_input');
           if (headers['x-csrf-token'] !== undefined) {
@@ -116,6 +126,7 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
             signal.addEventListener('abort', cancel, { once: true });
             if (signal.aborted) return cancel();
             try {
+              assertBeforeDispatch(options);
               request = send(url, {
                 method, headers, agent: false, servername: isIP(hostname) ? undefined : hostname,
                 lookup: (_name: string, lookupOptions: { all?: boolean }, callback: (...args: any[]) => void) =>
@@ -126,7 +137,7 @@ export function createTransport(dependencies: TransportDependencies = {}): Trans
                 void (async () => {
                   const status = response.statusCode ?? 0;
                   const resultHeaders: Record<string, string | string[]> = {};
-                  for (const key of ['content-type', 'location', 'set-cookie', 'content-length', 'content-encoding', 'content-range']) {
+                  for (const key of ['content-type', 'location', 'set-cookie', 'content-length', 'content-encoding', 'content-range', 'retry-after']) {
                     const value = response.headers[key]; if (value !== undefined) resultHeaders[key] = value;
                   }
                   if (status < 200 || status >= 300) {
