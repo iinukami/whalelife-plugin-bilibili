@@ -64,7 +64,9 @@ export interface BiliClientContract {
   danmaku(input: DanmakuInput, options: CallOptions): Promise<DanmakuResult>;
   checkRefresh(options: CallOptions): Promise<{ refresh: boolean; timestamp: number }>;
   refreshCsrf(timestamp: number, options: CallOptions): Promise<string>;
-  renewCookies(token: string, refreshCsrf: string, options: CallOptions): Promise<{ cookie: string; refreshToken: string }>;
+  renewCookies(token: string, refreshCsrf: string, options: CallOptions): Promise<{ cookie: string; refreshToken: string; removedCookieNames?: string[] }>;
+  prepareRefreshCookie?(cookie: string, options: CallOptions): Promise<string>;
+  discardDevice?(cookie: string, options: CallOptions): Promise<void>;
   confirmRefresh(token: string, options: CallOptions): Promise<void>;
   notifications(source: NotificationSource, cursor: NotificationCursor | undefined, options: CallOptions): Promise<NotificationList>;
   subtitles(bvid: string, cid: number, options: CallOptions): Promise<{ tracks: SubtitleTrack[]; loginRequired: boolean }>;

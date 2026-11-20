@@ -6,36 +6,21 @@ import { randomUUID } from 'node:crypto';
 import { BiliError } from './errors.ts';
 import { validateLoginUrl } from './login-url.ts';
 import { refreshToken as validateRefreshToken } from './refresh-client.ts';
+import { normalizeCookie, removedCookieNames, sameCookieAuthentication } from './cookies.ts';
+export { normalizeCookie } from './cookies.ts';
 import type { AccountState, BiliClientContract, CallOptions } from './types.ts';
 
 export interface AccountStorage { read(): Promise<unknown>; save(value: unknown): Promise<void> }
+export interface AuthDependencies {
+  prepareRefreshCookie?: (cookie: string, options: CallOptions) => Promise<string>;
+  discardRefreshDevice?: (cookies: readonly string[], options: CallOptions) => Promise<void>;
+}
 export interface PublicAccount { loggedIn: boolean; revision: string; mid?: number; name?: string; invalidStoredState?: boolean }
 export interface LoginState { state: 'waiting' | 'scanned' | 'expired' | 'confirmed'; account?: PublicAccount }
 interface PendingLogin {
   id: string; key: string; expiresAt: number; generation: number; revision: string;
   lastPoll: number; lastState: LoginState; controller: AbortController; polling?: Promise<LoginState>;
   expiryTimer?: ReturnType<typeof setTimeout>;
-}
-// Only these browser cookie names are retained; unrelated site/tracking cookies are discarded.
-const retainedCookieNames = new Set(['SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5', 'sid',
-  'buvid3', 'buvid4', 'buvid_fp', 'buvid_fp_plain', 'b_nut', 'b_lsid', '_uuid', 'bili_ticket', 'bili_ticket_expires']);
-export function normalizeCookie(value: unknown): string {
-  if (typeof value !== 'string' || value.length < 1 || value.length > 16384 || /[\x00-\x1f\x7f]/.test(value)) throw new BiliError('invalid_input');
-  const input = value.trim().replace(/^Cookie:\s*/i, '');
-  const cookies = new Map<string, string>();
-  for (const part of input.split(';')) {
-    const piece = part.trim();
-    if (!piece) continue;
-    const match = /^([A-Za-z0-9_-]+)=([^\s;,"\\]*)$/.exec(piece);
-    if (!match || match[2]!.length > 8192) throw new BiliError('invalid_input');
-    const [, name, content] = match;
-    if (!retainedCookieNames.has(name!)) continue;
-    if (!content || !/^[\x21-\x7e]+$/.test(content) || cookies.has(name!)) throw new BiliError('invalid_input');
-    cookies.set(name!, content);
-  }
-  if (!cookies.has('SESSDATA') || !/^[A-Fa-f0-9]{32}$/.test(cookies.get('bili_jct') ?? '') ||
-      !/^[1-9]\d{0,15}$/.test(cookies.get('DedeUserID') ?? '') || !Number.isSafeInteger(Number(cookies.get('DedeUserID')))) throw new BiliError('invalid_input');
-  return [...cookies].map(([key, content]) => `${key}=${content}`).join('; ');
 }
 function cookieMid(cookie: string): number { return Number(/(?:^|; )DedeUserID=(\d+)(?:;|$)/.exec(cookie)?.[1]); }
 function safeName(value: unknown): string {
@@ -58,6 +43,7 @@ export class AuthManager {
   private current?: AccountState;
   private revision: string = randomUUID();
   private invalidStoredState = false;
+  private unverifiedRefresh = false;
   private generation = 0;
   private pending?: PendingLogin;
   private operation?: AbortController;
@@ -75,9 +61,11 @@ export class AuthManager {
   private readonly signal: AbortSignal;
   private readonly timeoutMs: number;
   private readonly now: () => number;
+  private readonly dependencies: AuthDependencies;
   constructor(client: BiliClientContract, storage: AccountStorage,
-    signal: AbortSignal, timeoutMs = 15000, now: () => number = Date.now) {
+    signal: AbortSignal, timeoutMs = 15000, now: () => number = Date.now, dependencies: AuthDependencies = {}) {
     this.client = client; this.storage = storage; this.signal = signal; this.timeoutMs = timeoutMs; this.now = now;
+    this.dependencies = dependencies;
     this.stop = () => { this.disposed = true; this.invalidate(); };
     signal.addEventListener('abort', this.stop, { once: true });
     if (signal.aborted) this.stop();
@@ -101,16 +89,17 @@ export class AuthManager {
       if (account.refreshState !== undefined && (!token || !['pending', 'confirming', 'uncertain'].includes(String(account.refreshState)))) throw new BiliError('config_invalid');
       this.current = { cookie, mid: account.mid as number, name: safeName(account.name), revision: data.revision,
         ...(token ? { refreshToken: token } : {}), ...(account.refreshState ? { refreshState: 'uncertain' as const } : {}) };
+      this.unverifiedRefresh = account.refreshState === 'pending' || account.refreshState === 'uncertain';
       this.revision = data.revision;
     } catch { this.current = undefined; this.invalidStoredState = true; }
   }
   state(): PublicAccount {
-    return { loggedIn: !!this.current, revision: this.revision,
-      ...(this.current ? { mid: this.current.mid, name: this.current.name } : {}),
+    return { loggedIn: !!this.current && !this.unverifiedRefresh, revision: this.revision,
+      ...(this.current && !this.unverifiedRefresh ? { mid: this.current.mid, name: this.current.name } : {}),
       ...(this.invalidStoredState ? { invalidStoredState: true } : {}) };
   }
   /** Backend-only snapshot. Never expose to a model, page, receipt or log. */
-  snapshot(): AccountState | undefined { return this.current ? { ...this.current } : undefined; }
+  snapshot(): AccountState | undefined { return this.current && !this.unverifiedRefresh ? { ...this.current } : undefined; }
   /** Credential rotation preserves this identity; a deliberate login/import/logout changes it. */
   identity(): string { return this.current?.revision ?? this.revision; }
   configureRefresh(enabled: boolean) {
@@ -166,6 +155,7 @@ export class AuthManager {
       // A save already in flight cannot be undone; mirror its committed revision before rejecting a superseded request.
       this.revision = nextRevision;
       this.current = account ? { ...account, revision: nextRevision } : undefined;
+      this.unverifiedRefresh = false;
       this.invalidStoredState = false;
       this.check(generation, signal);
       return this.state();
@@ -256,6 +246,7 @@ export class AuthManager {
       try { await this.storage.save({ schema: 1, revision: nextRevision, account: saved }); }
       catch { throw new BiliError('persistence_error'); }
       this.current = { ...saved, revision: identity }; this.revision = nextRevision;
+      this.unverifiedRefresh = saved.refreshState === 'pending' || saved.refreshState === 'uncertain';
       this.check(generation, signal);
     });
     this.saving = task.catch(() => {}); return task;
@@ -263,7 +254,12 @@ export class AuthManager {
   /** At most one on-demand check each day. Failed checks cool down; uncertain writes never replay. */
   async ensureFresh(signal?: AbortSignal): Promise<void> {
     await this.ready; this.check(undefined, signal);
-    if (this.refreshFlight) { await waitForRefresh(this.refreshFlight, AbortSignal.any([this.signal, ...(signal ? [signal] : [])])); this.check(undefined, signal); return; }
+    if (this.refreshFlight) {
+      await waitForRefresh(this.refreshFlight, AbortSignal.any([this.signal, ...(signal ? [signal] : [])])); this.check(undefined, signal);
+      if (this.unverifiedRefresh) throw new BiliError('login_required');
+      return;
+    }
+    if (this.unverifiedRefresh) throw new BiliError('login_required');
     if (!this.refreshEnabled || !this.current?.refreshToken || this.current.refreshState || this.pending || this.operation) return;
     if (this.now() < this.nextRefreshCheck) return;
     const original = this.snapshot()!, generation = this.generation, controller = new AbortController();
@@ -273,16 +269,29 @@ export class AuthManager {
       this.check(generation, options.signal);
       if (!this.refreshEnabled || this.current?.revision !== original.revision) throw new BiliError('config_conflict');
     };
+    options.assertCurrent = check;
     const task = (async () => {
       this.refreshStatus = 'checking'; this.lastRefreshCheck = this.now(); this.nextRefreshCheck = this.now() + 15 * 60 * 1000;
       try {
+        if (this.dependencies.prepareRefreshCookie) {
+          const prepared = normalizeCookie(await this.dependencies.prepareRefreshCookie(original.cookie, options)); check();
+          if (!sameCookieAuthentication(original.cookie, prepared)) throw new BiliError('account_changed');
+          options.cookie = prepared;
+        }
         const info = await this.client.checkRefresh(options); check();
         if (!info.refresh) { this.refreshStatus = 'current'; this.nextRefreshCheck = this.now() + 86400000; return; }
         const csrf = await this.client.refreshCsrf(info.timestamp, options); check();
-        await this.saveRefresh({ ...original, refreshState: 'pending' }, generation, options.signal!); check();
+        await this.saveRefresh({ ...original, cookie: options.cookie!, refreshState: 'pending' }, generation, options.signal!); check();
         const fresh = await this.client.renewCookies(original.refreshToken!, csrf, options); check();
         const cookie = normalizeCookie(fresh.cookie), token = validateRefreshToken(fresh.refreshToken);
         if (cookieMid(cookie) !== original.mid) throw new BiliError('account_changed');
+        const removed = removedCookieNames(fresh.removedCookieNames);
+        // The platform already rotated credentials. Persist the unverified candidate before any fallible follow-up.
+        // A pending snapshot is unavailable to business calls, including after restart; it is never a verified login.
+        await this.saveRefresh({ ...original, cookie, refreshToken: token, refreshState: 'pending' }, generation, options.signal!); check();
+        if (removed.includes('buvid3') && this.dependencies.discardRefreshDevice) {
+          await this.dependencies.discardRefreshDevice([...new Set([original.cookie, options.cookie!, cookie])], options); check();
+        }
         const verified = await this.verified(cookie, { ...options, cookie }); check();
         const updated: AccountState = { ...verified, revision: original.revision, refreshToken: token, refreshState: 'confirming' };
         await this.saveRefresh(updated, generation, options.signal!); check();
@@ -292,12 +301,12 @@ export class AuthManager {
         this.refreshStatus = 'refreshed'; this.nextRefreshCheck = this.now() + 86400000;
       } catch {
         // A pending/confirming marker stays durable after any uncertain write, stop or failed save.
-        // Ordinary browsing may still use the saved cookie; renewal requires a fresh login after uncertainty.
+        // Only a verified confirming snapshot remains usable. An unverified pending candidate requires a fresh login.
         if (generation === this.generation) this.refreshStatus = this.current?.refreshState ? 'uncertain' : 'failed';
       }
     })();
     this.refreshFlight = task;
-    try { await task; this.check(undefined, signal); }
+    try { await task; this.check(undefined, signal); if (this.unverifiedRefresh) throw new BiliError('login_required'); }
     finally { if (this.refreshFlight === task) this.refreshFlight = undefined; if (this.refreshController === controller) this.refreshController = undefined; }
   }
   async dispose() { this.stop(); this.signal.removeEventListener('abort', this.stop); await this.saving; }

@@ -45,7 +45,7 @@ test('renewal saves pending, verifies and saves new credentials before confirmin
   const f = fixture(); t.after(() => f.auth.dispose()); await f.auth.ready;
   const identity = f.auth.identity(), revision = f.auth.state().revision; f.auth.configureRefresh(true);
   await f.auth.ensureFresh(); assert.deepEqual(f.calls, ['check', 'csrf', 'renew', 'account', 'confirm']);
-  assert.deepEqual(f.writes.map(w => w.account.refreshState), ['pending', 'confirming', undefined]);
+  assert.deepEqual(f.writes.map(w => w.account.refreshState), ['pending', 'pending', 'confirming', undefined]);
   assert.equal(f.auth.identity(), identity); assert.notEqual(f.auth.state().revision, revision); assert.equal(f.auth.snapshot()!.cookie, NEW);
   assert.equal(f.auth.renewalState().status, 'refreshed'); assert.equal((await f.auth.folders()).length, 1);
   assert.ok(!JSON.stringify({ account: f.auth.state(), renewal: f.auth.renewalState() }).includes('SYNTHETIC_'));
@@ -70,10 +70,14 @@ test('uncertain refresh or confirmation never replays, including after restart',
     if (stage === 'renew') f.client.renewCookies = async () => { f.calls.push('renew'); throw new BiliError('uncertain'); };
     if (stage === 'confirm') f.client.confirmRefresh = async () => { f.calls.push('confirm'); throw new BiliError('uncertain'); };
     if (stage === 'save-new') { const save = f.storage.save; f.storage.save = async value => { if (value.account?.cookie === NEW) throw Error('synthetic disk failure'); await save(value); }; }
-    await f.auth.ensureFresh(); assert.equal(f.auth.renewalState().status, 'uncertain'); const count = f.calls.length;
-    f.advance(999999999); await f.auth.ensureFresh(); assert.equal(f.calls.length, count);
+    if (stage === 'confirm') await f.auth.ensureFresh(); else await assert.rejects(f.auth.ensureFresh(), code('login_required'));
+    assert.equal(f.auth.renewalState().status, 'uncertain'); const count = f.calls.length;
+    f.advance(999999999);
+    if (stage === 'confirm') await f.auth.ensureFresh(); else await assert.rejects(f.auth.ensureFresh(), code('login_required'));
+    assert.equal(f.calls.length, count);
     const restart = fixture(f.stored); t.after(() => restart.auth.dispose()); await restart.auth.ready; restart.auth.configureRefresh(true);
-    await restart.auth.ensureFresh(); assert.equal(restart.calls.length, 0); assert.equal(restart.auth.renewalState().status, 'uncertain');
+    if (stage === 'confirm') await restart.auth.ensureFresh(); else await assert.rejects(restart.auth.ensureFresh(), code('login_required'));
+    assert.equal(restart.calls.length, 0); assert.equal(restart.auth.renewalState().status, 'uncertain');
     if (stage === 'save-new') assert.equal(f.calls.includes('confirm'), false);
   }
 });

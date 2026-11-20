@@ -29,9 +29,12 @@ export async function applyWithDependencies(ctx: Context, dependencies: Dependen
   const client = dependencies.client ?? new BiliClient({ signal: ctx.signal,
     transport: createProtectedTransport(dependencies.transport ?? createTransport(), {
       read: () => ctx.config.read('traffic-state.json'), save: value => ctx.config.save('traffic-state.json', value), ...dependencies.trafficTiming,
-    }), readDevice: scope => devices.read(scope), saveDevice: (scope, buvid) => devices.save(scope, buvid),
+    }), readDevice: scope => devices.read(scope), saveDevice: (scope, buvid) => devices.save(scope, buvid), removeDevice: scope => devices.remove(scope),
     onDiagnostic: event => event.stage === 'comment' ? ctx.logger.info('B 站评论诊断', event) : ctx.logger.warn('B 站请求失败', event) });
-  const auth = new AuthManager(client, { read: () => ctx.config.read('account.json'), save: value => ctx.config.save('account.json', value) }, ctx.signal, 20000, dependencies.now);
+  const auth = new AuthManager(client, { read: () => ctx.config.read('account.json'), save: value => ctx.config.save('account.json', value) }, ctx.signal, 20000, dependencies.now, {
+    prepareRefreshCookie: (cookie, options) => client.prepareRefreshCookie?.(cookie, options) ?? Promise.resolve(cookie),
+    discardRefreshDevice: async (cookies, options) => { for (const cookie of new Set(cookies)) await client.discardDevice?.(cookie, options); },
+  });
   auth.configureRefresh(config.autoRefreshEnabled);
   const owner = new OwnerManager(client, { read: () => ctx.config.read('owner.json'), save: value => ctx.config.save('owner.json', value) }, ctx.signal, () => auth.snapshot(), () => auth.identity());
   const surf = ctx.get<SurfService>('surf');

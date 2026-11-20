@@ -39,5 +39,13 @@ export function createDeviceStore(options: { read: () => Promise<unknown>; save:
       try { await options.save({ schema: 1, entries: next }); } catch { throw new BiliError('persistence_error'); }
       check(); entries = next;
     }); },
+    remove(scope: string): Promise<void> { return serial(async () => {
+      if (!validScope(scope)) throw new BiliError('invalid_input');
+      const current = await load(); check();
+      const next = current.filter(row => row.scope !== scope);
+      if (next.length === current.length) return;
+      try { await options.save({ schema: 1, entries: next }); } catch { throw new BiliError('persistence_error'); }
+      check(); entries = next;
+    }); },
   };
 }

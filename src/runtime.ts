@@ -159,7 +159,7 @@ export class BiliRuntime {
   private checkOperation(identity: string, options: CallOptions) {
     this.guard();
     if (options.signal?.aborted) throw new BiliError('cancelled');
-    if (identity !== this.identity()) throw new BiliError('account_changed');
+    if (identity !== this.identity() || options.cookie !== this.options.account()?.cookie) throw new BiliError('account_changed');
   }
   private sweep() {
     for (const [id, ref] of this.refs) if (ref.expires <= this.now() || ref.account !== this.identity()) this.refs.delete(id);
@@ -577,6 +577,7 @@ export class BiliRuntime {
         catch { this.ledgerReady = false; throw new BiliError('persistence_error'); }
         options.signal?.throwIfAborted();
         if (this.identity() !== account.revision) throw new BiliError('account_changed');
+        this.checkOperation(identity, options);
         check();
         submitted = true;
         const result = await this.client.interact({ action, aid: ref.video.aid, bvid: ref.video.bvid, mid: ref.video.owner.mid, enabled: true, folderId, text,

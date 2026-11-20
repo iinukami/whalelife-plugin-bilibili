@@ -3,6 +3,7 @@
  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
  */
 import { BiliError } from './errors.ts';
+import { mergeResponseCookies } from './cookies.ts';
 import { createHash } from 'node:crypto';
 import { readCommentPublication, submissionMetadata, validateCommentCheck } from './comment-publication.ts';
 import { validateOwnerUid, validateOwnerProfile } from './owner.ts';
@@ -24,7 +25,6 @@ const API = 'https://api.bilibili.com';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PASSPORT = 'https://passport.bilibili.com';
 const BV = /^BV[A-Za-z0-9]{10}$/;
-const AUTH_COOKIES = new Set(['SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5']);
 function record(value: unknown): Record<string, any> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new BiliError('malformed_response'); return value as Record<string, any>;
 }
@@ -197,8 +197,11 @@ interface WbiPreparation {
   identity: string;
   buvid?: string;
   deviceLoaded?: boolean;
+  deviceDiscarded?: boolean;
+  deviceFailure?: boolean;
   keys?: { value: WbiKeys; expires: number };
   pending: Promise<void>;
+  users: number;
   failure?: { error: unknown };
 }
 
@@ -206,6 +209,7 @@ export interface BiliClientOptions {
   transport?: Transport; signal?: AbortSignal; onDiagnostic?: DiagnosticSink;
   readDevice?: (scope: string) => string | undefined | Promise<string | undefined>;
   saveDevice?: (scope: string, buvid: string) => void | Promise<void>;
+  removeDevice?: (scope: string) => void | Promise<void>;
   publicationNow?: () => number;
   publicationSleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
@@ -216,7 +220,7 @@ export class BiliClient implements BiliClientContract {
   private knownImages = new Set<string>();
   private knownSubtitles = new Map<string, { cookie: string; referer: string; expires: number }>();
   private loginKeys = new Map<string, number>();
-  private wbiPreparation?: WbiPreparation;
+  private wbiPreparations = new Map<string, WbiPreparation>();
   private dependencies: BiliClientOptions;
   constructor(options: BiliClientOptions = {}) {
     this.dependencies = options;
@@ -269,13 +273,17 @@ export class BiliClient implements BiliClientContract {
     });
     this.options(options);
   }
-  private async prepareWbi(options: CallOptions, purpose: 'search' | 'subtitle' | 'comment' = 'search'): Promise<{ cookie: string; keys: WbiKeys }> {
+  private async inPreparation<T>(identity: string, options: CallOptions, job: (state: WbiPreparation) => Promise<T>, shareFailure = false): Promise<T> {
     this.options(options);
-    const identity = checkedCookie(options.cookie);
-    let state = this.wbiPreparation;
-    if (!state || state.identity !== identity) {
-      state = { identity, pending: Promise.resolve() };
-      this.wbiPreparation = state;
+    let state = this.wbiPreparations.get(identity);
+    if (!state) {
+      if (this.wbiPreparations.size >= 32) {
+        const idle = [...this.wbiPreparations].find(([, value]) => value.users === 0);
+        if (!idle) throw new BiliError('busy');
+        this.wbiPreparations.delete(idle[0]);
+      }
+      state = { identity, pending: Promise.resolve(), users: 0 };
+      this.wbiPreparations.set(identity, state);
     }
     // Serialize preparation only. A cancelled waiter never cancels another caller's work.
     const preceding = state.pending, observedFailure = state.failure;
@@ -283,24 +291,65 @@ export class BiliClient implements BiliClientContract {
     let release!: () => void;
     const ticket = new Promise<void>(resolve => { release = resolve; });
     state.pending = preceding.then(() => ticket);
+    state.users++;
     try {
       await this.waitWbiPreparation(preceding, options);
-      if (state.failure && state.failure !== observedFailure) throw state.failure.error;
+      if (shareFailure && state.failure && state.failure !== observedFailure) throw state.failure.error;
       attempting = true;
-      let cookie = identity;
+      return await job(state);
+    } catch (error) {
+      if (shareFailure && attempting && !(error instanceof BiliError && ['cancelled', 'stopped', 'account_changed'].includes(error.code))) state.failure = { error };
+      throw error;
+    } finally { state.users--; release(); }
+  }
+  private async existingDeviceCookie(state: WbiPreparation, options: CallOptions): Promise<string> {
+    this.options(options);
+    if (state.deviceFailure) throw new BiliError('persistence_error');
+    const cookie = state.deviceDiscarded ? state.identity.split('; ').filter(part => !part.startsWith('buvid3=')).join('; ') : state.identity;
+    if (cookieValue(cookie, 'buvid3')) return cookie;
+    if (!state.deviceLoaded) {
+      let persisted: string | undefined;
+      try { persisted = cookieValue(cookie, 'SESSDATA') ? await this.dependencies.readDevice?.(createHash('sha256').update(state.identity).digest('hex')) : undefined; }
+      catch { throw new BiliError('persistence_error'); }
+      this.options(options);
+      if (persisted !== undefined && (typeof persisted !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(persisted))) throw new BiliError('persistence_error');
+      state.buvid = persisted; state.deviceLoaded = true;
+    }
+    return state.buvid ? cookie + (cookie ? '; ' : '') + 'buvid3=' + state.buvid : cookie;
+  }
+  /** Restore only this exact login context's existing device. Never obtains a new device or signing key. */
+  async prepareRefreshCookie(cookie: string, options: CallOptions): Promise<string> {
+    const identity = checkedCookie(cookie);
+    this.options(options);
+    if (!cookieValue(identity, 'SESSDATA')) return identity;
+    return this.inPreparation(identity, options, state => this.existingDeviceCookie(state, options));
+  }
+  /** Remove a server-invalidated device only from the explicitly named credential context. */
+  async discardDevice(cookie: string, options: CallOptions): Promise<void> {
+    const identity = checkedCookie(cookie);
+    await this.inPreparation(identity, options, async state => {
+      this.options(options);
+      state.buvid = undefined; state.keys = undefined; state.failure = undefined;
+      state.deviceLoaded = true; state.deviceDiscarded = true; state.deviceFailure = true;
+      try {
+        if (cookieValue(identity, 'SESSDATA')) {
+          if (this.dependencies.readDevice && !this.dependencies.removeDevice) throw new BiliError('persistence_error');
+          await this.dependencies.removeDevice?.(createHash('sha256').update(identity).digest('hex'));
+        }
+      } catch { throw new BiliError('persistence_error'); }
+      state.deviceFailure = false;
+      this.options(options);
+    });
+  }
+  private async prepareWbi(options: CallOptions, purpose: 'search' | 'subtitle' | 'comment' = 'search'): Promise<{ cookie: string; keys: WbiKeys }> {
+    const identity = checkedCookie(options.cookie);
+    return this.inPreparation(identity, options, async state => {
+      let cookie = await this.existingDeviceCookie(state, options);
       if (!cookieValue(cookie, 'buvid3')) {
         const scope = createHash('sha256').update(identity).digest('hex');
         const authenticated = !!cookieValue(identity, 'SESSDATA');
-        if (!state.deviceLoaded) {
-          let persisted: string | undefined;
-          try { persisted = authenticated ? await this.dependencies.readDevice?.(scope) : undefined; }
-          catch { throw new BiliError('persistence_error'); }
-          this.options(options);
-          if (persisted !== undefined && (typeof persisted !== 'string' || !/^[A-Za-z0-9_-]{8,200}$/.test(persisted))) throw new BiliError('persistence_error');
-          state.buvid = persisted; state.deviceLoaded = true;
-        }
         if (!state.buvid) {
-          const response = await this.request('/x/web-frontend/getbuvid', {}, options, false, purpose === 'subtitle' ? 'subtitle_cookie' : undefined);
+          const response = await this.request('/x/web-frontend/getbuvid', {}, { ...options, cookie }, false, purpose === 'subtitle' ? 'subtitle_cookie' : undefined);
           this.options(options);
           let issued: Record<string, any> | undefined;
           try {
@@ -338,10 +387,7 @@ export class BiliClient implements BiliClientContract {
       this.options(options);
       state.failure = undefined;
       return { cookie, keys: state.keys.value };
-    } catch (error) {
-      if (attempting && !(error instanceof BiliError && ['cancelled', 'stopped', 'account_changed'].includes(error.code))) state.failure = { error };
-      throw error;
-    } finally { release(); }
+    }, true);
   }
   private remember(set: Set<string>, value: string) { if (set.size >= 1024) set.delete(set.values().next().value!); set.add(value); }
   private item(raw: unknown, author?: unknown): VideoItem | undefined {
@@ -448,6 +494,7 @@ export class BiliClient implements BiliClientContract {
   }
   async comment(aid: number, rpid: string, options: CallOptions): Promise<ThreadComment> {
     if (typeof aid !== 'number') throw new BiliError('invalid_input'); integer(aid); checkedCommentId(rpid);
+    options = { ...options, cookie: await this.prepareRefreshCookie(checkedCookie(options.cookie), options) };
     // The official detail response calls the selected row "root", including when the selected rpid is a child reply.
     const data = apiData(await this.request('/x/v2/reply/detail', { type: '1', oid: String(aid), root: rpid }, options));
     try {
@@ -459,6 +506,7 @@ export class BiliClient implements BiliClientContract {
   }
   async thread(aid: number, root: string, page: number, options: CallOptions): Promise<CommentThread> {
     if (typeof aid !== 'number' || typeof page !== 'number') throw new BiliError('invalid_input'); integer(aid); checkedCommentId(root); pageNumber(page);
+    options = { ...options, cookie: await this.prepareRefreshCookie(checkedCookie(options.cookie), options) };
     const data = apiData(await this.request('/x/v2/reply/reply', { type: '1', oid: String(aid), root, pn: String(page), ps: '20' }, options));
     try {
       if (data.root === null) throw new BiliError('reference_unavailable');
@@ -645,6 +693,7 @@ export class BiliClient implements BiliClientContract {
   }
   async account(options: CallOptions) {
     if (!checkedCookie(options.cookie)) throw new BiliError('login_required');
+    options = { ...options, cookie: await this.prepareRefreshCookie(checkedCookie(options.cookie), options) };
     const data = apiData(await this.request('/x/web-interface/nav', {}, options));
     if (data.isLogin !== true) throw new BiliError('login_required');
     try { return { mid: integer(data.mid), name: plain(data.uname, 200) }; } catch { throw new BiliError('malformed_response'); }
@@ -666,11 +715,7 @@ export class BiliClient implements BiliClientContract {
     if (data.code === 86090) return { state: 'scanned' };
     if (data.code === 86038) { this.loginKeys.delete(key); return { state: 'expired' }; }
     if (data.code !== 0) throw new BiliError('platform_error');
-    const headers = response.headers['set-cookie'];
-    const parts = (Array.isArray(headers) ? headers : typeof headers === 'string' ? [headers] : []).flatMap(header => {
-      const pair = header.split(';', 1)[0]; const name = pair.slice(0, pair.indexOf('=')); return AUTH_COOKIES.has(name) ? [pair] : [];
-    });
-    const cookie = checkedCookie(parts.join('; '));
+    const { cookie } = mergeResponseCookies(response.headers['set-cookie']);
     if (!cookieValue(cookie, 'SESSDATA') || !cookieValue(cookie, 'bili_jct') || !/^\d+$/.test(cookieValue(cookie, 'DedeUserID'))) throw new BiliError('malformed_response');
     const token = data.refresh_token === undefined || data.refresh_token === '' ? undefined : refreshToken(data.refresh_token);
     this.loginKeys.delete(key); return { state: 'confirmed', cookie, ...(token ? { refreshToken: token } : {}) };
@@ -701,8 +746,11 @@ export class BiliClient implements BiliClientContract {
     return readCommentPublication(input, platformId, {
       signal: call.signal, guard: () => { this.options(options); },
       now: this.dependencies.publicationNow, sleep: this.dependencies.publicationSleep,
-      read: (audience, timeoutMs, signal) => this.request('/x/v2/reply/detail', { type: '1', oid: String(input.aid), root: platformId },
-        { ...options, signal, timeoutMs: Math.min(timeoutMs, call.timeoutMs), cookie: audience === 'anonymous' ? undefined : options.cookie }, false, undefined, referer),
+      read: async (audience, timeoutMs, signal) => {
+        const selected = { ...options, signal, timeoutMs: Math.min(timeoutMs, call.timeoutMs) };
+        const cookie = audience === 'anonymous' ? undefined : await this.prepareRefreshCookie(checkedCookie(options.cookie), selected);
+        return this.request('/x/v2/reply/detail', { type: '1', oid: String(input.aid), root: platformId }, { ...selected, cookie }, false, undefined, referer);
+      },
       report: (response, evidence) => reportCommentResponse(response, { commentPhase: 'visibility', targetAid: input.aid,
         commentId: platformId, audience: evidence.audience, outcome: evidence.outcome, apiCode: evidence.apiCode }),
     });
@@ -775,5 +823,5 @@ export class BiliClient implements BiliClientContract {
     }
     return { state: 'confirmed' };
   }
-  async dispose() { this.aborter.abort(); this.wbiPreparation = undefined; this.knownImages.clear(); this.knownSubtitles.clear(); this.loginKeys.clear(); await this.transport.dispose(); }
+  async dispose() { this.aborter.abort(); this.wbiPreparations.clear(); this.knownImages.clear(); this.knownSubtitles.clear(); this.loginKeys.clear(); await this.transport.dispose(); }
 }

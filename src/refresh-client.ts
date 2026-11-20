@@ -3,7 +3,7 @@
  * Additional terms under AGPLv3 Section 7: see LICENSE-ADDITIONAL.
  */
 import { constants, publicEncrypt } from 'node:crypto';
-import { normalizeCookie } from './auth.ts';
+import { mergeResponseCookies, normalizeCookie } from './cookies.ts';
 import { BiliError } from './errors.ts';
 import { safeUrl, TransportError } from './transport.ts';
 import type { Transport, TransportResponse } from './transport.ts';
@@ -21,9 +21,11 @@ export function refreshToken(value: unknown): string {
 }
 function call(options: CallOptions) {
   if (options.signal?.aborted) throw new BiliError('cancelled');
+  options.assertCurrent?.();
   if (!options.cookie) throw new BiliError('login_required');
   const cookie = normalizeCookie(options.cookie);
   return { signal: options.signal, timeoutMs: options.timeoutMs ?? 20000, maxBytes: 1024 * 1024,
+    beforeDispatch: () => { if (options.signal?.aborted) throw new BiliError('cancelled'); options.assertCurrent?.(); },
     headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/', Cookie: cookie } };
 }
 const csrf = (cookie: string) => /(?:^|; )bili_jct=([a-fA-F0-9]{32})(?:;|$)/.exec(cookie)![1]!;
@@ -65,15 +67,14 @@ async function post(transport: Transport, path: 'cookie/refresh' | 'confirm/refr
     headers: { ...request.headers, 'Content-Type': 'application/x-www-form-urlencoded' } }); }
   catch (error) { if (error instanceof TransportError && !error.submitted) throw error; throw new BiliError('uncertain'); }
   let value: any; try { value = json(response, url); } catch { throw new BiliError('uncertain'); }
-  success(value); return { response, value };
+  success(value); return { response, value, requestCookie: request.headers.Cookie };
 }
-export async function renewCookies(transport: Transport, token: string, refreshCsrf: string, options: CallOptions): Promise<{ cookie: string; refreshToken: string }> {
-  const { response, value } = await post(transport, 'cookie/refresh', { refresh_token: refreshToken(token), refresh_csrf: refreshToken(refreshCsrf), source: 'main_web' }, options);
+export async function renewCookies(transport: Transport, token: string, refreshCsrf: string, options: CallOptions): Promise<{ cookie: string; refreshToken: string; removedCookieNames?: string[] }> {
+  const { response, value, requestCookie } = await post(transport, 'cookie/refresh', { refresh_token: refreshToken(token), refresh_csrf: refreshToken(refreshCsrf), source: 'main_web' }, options);
   try {
-    const headers = response.headers['set-cookie'];
-    const selected = (Array.isArray(headers) ? headers : typeof headers === 'string' ? [headers] : []).map(value => value.split(';', 1)[0]!)
-      .filter(pair => /^(SESSDATA|bili_jct|DedeUserID|DedeUserID__ckMd5)=/.test(pair));
-    return { cookie: normalizeCookie(selected.join('; ')), refreshToken: refreshToken(value.data?.refresh_token) };
+    const merged = mergeResponseCookies(response.headers['set-cookie'], requestCookie);
+    return { cookie: merged.cookie, refreshToken: refreshToken(value.data?.refresh_token),
+      ...(merged.removedCookieNames.length ? { removedCookieNames: merged.removedCookieNames } : {}) };
   } catch { throw new BiliError('uncertain'); }
 }
 export async function confirmRefresh(transport: Transport, token: string, options: CallOptions): Promise<void> {

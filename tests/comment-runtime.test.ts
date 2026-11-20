@@ -298,3 +298,20 @@ test('retrying an earlier cooled-down ID cannot override another accepted or unc
     assert.equal(f.posts.length, 2, 'a previous unsubmitted ID cannot cause a third attempt');
   }
 });
+
+
+test('credential rotation during pending save blocks the old request while retaining same-account video references', async t => {
+  const f = fixture(t); await f.runtime.initialize(); const ref = await f.open();
+  const originalRevision = f.account.revision;
+  f.onSave(async value => {
+    if (value.entries.some((entry: any) => entry.state === 'pending')) {
+      f.account.cookie = f.account.cookie.replace('SESSDATA=SYNTHETIC;', 'SESSDATA=SYNTHETIC_ROTATED;');
+    }
+  });
+  const result: any = await f.runtime.interact(args(ref), f.session);
+  assert.equal(result.content.status, 'error'); assert.equal(result.content.error.code, 'account_changed');
+  assert.equal(result.content.state, 'rejected'); assert.equal(f.posts.length, 0);
+  assert.equal(f.saved.entries[0].state, 'rejected'); assert.equal(f.account.revision, originalRevision);
+  const read: any = await f.runtime.read('comments', { videoRef: ref }, f.session);
+  assert.equal(read.content.status, 'ok', 'credential rotation does not invalidate same-account references');
+});
